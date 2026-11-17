@@ -53,4 +53,4 @@ The earlier blank-model handover was confirmed in recorded frames. The retained-
 
 ## Demo media
 
-A public recording has not been prepared. Existing reference footage and development recordings are private working material and are not bundled here. The intended demonstration is: choose collectible → select recipient → enable surprise → confirm → sealed chat card → unwrap → settled collectible.
+A public implementation recording has not been prepared. Three selected stills from the supplied design reference are included in `screenshots/` and labelled as concept frames in the README. The full reference video and development recordings are not bundled. The intended implementation demonstration is: choose collectible → select recipient → enable surprise → confirm → sealed chat card → unwrap → settled collectible.

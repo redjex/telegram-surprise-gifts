@@ -4,6 +4,14 @@ Give a collectible a moment of surprise. Send it wrapped, then unwrap it in the 
 
 A native iOS concept built with Telegram's existing gift cards, collectible composition and attribute reels.
 
+## Concept preview
+
+| Send as a surprise | Wrapped in the chat | Collectible revealed |
+| --- | --- | --- |
+| ![Transfer confirmation with Send as a surprise enabled](screenshots/transfer.png) | ![Sealed gift card with the Unwrap button](screenshots/sealed.png) | ![Opened collectible with its model, backdrop and symbol](screenshots/opened.png) |
+
+Selected frames from the supplied concept video (4.5 s, 7.0 s and 12.5 s), credited to **@IdeaAnimator** and **@azc0n**. These illustrate the original design reference, not screenshots of this implementation; the current demo uses the green-star sticker for the sealed gift.
+
 ## How it works
 
 1. Choose a collectible in the marketplace and simulate purchasing it for its listed Stars or TON price.
