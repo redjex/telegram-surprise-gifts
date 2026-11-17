@@ -1,0 +1,2154 @@
+diff --git a/build-system/Make/Make.py b/build-system/Make/Make.py
+index 08b05aef860f032d9d298e96cb28c5ad5a97eb08..78232a4bf76c91261de9feb562575b4e6ee456b3 100644
+--- a/build-system/Make/Make.py
++++ b/build-system/Make/Make.py
+@@ -634,6 +634,10 @@ def build(bazel, arguments):
+     )
+ 
+     bazel_command_line.set_configuration(arguments.configuration)
++    # Simulator apps do not use provisioning profiles. Avoid resolving device-only
++    # profile labels in a fresh checkout with Xcode-managed signing.
++    if arguments.configuration in ('debug_sim_arm64', 'release_sim_arm64', 'debug_sim_x86_64', 'release_sim_x86_64'):
++        bazel_command_line.set_disable_provisioning_profiles()
+     if arguments.embedWatchApp:
+         if arguments.configuration in ('debug_arm64', 'release_arm64'):
+             if arguments.watchApiId is None or arguments.watchApiHash is None:
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/LocalWidgetMessages.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/LocalWidgetMessages.swift
+index 9a6ef9d73c93802cb546acb11751948b6f10dd79..5713e920c7b8f8eb130b599725d8f38eb50aa56c 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/LocalWidgetMessages.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/LocalWidgetMessages.swift
+@@ -2,6 +2,32 @@ import Foundation
+ import Postbox
+ import SwiftSignalKit
+ 
++public let localSurpriseGiftSealedMarker = "local-surprise-gift:sealed:v1"
++public let localSurpriseGiftOpenedMarker = "local-surprise-gift:opened:v1"
++
++func _internal_insertLocalSurpriseGift(account: Account, peerId: PeerId, gift: StarGift.UniqueGift, asSurprise: Bool) -> Signal<Int, NoError> {
++    let timestamp = Int32(account.network.context.globalTime())
++    let action = TelegramMediaAction(action: .starGiftUnique(gift: .unique(gift), isUpgrade: false, isTransferred: false, savedToProfile: false, canExportDate: nil, transferStars: nil, isRefunded: false, isPrepaidUpgrade: false, peerId: nil, senderId: account.peerId, savedId: nil, resaleAmount: nil, canTransferDate: nil, canResaleDate: nil, dropOriginalDetailsStars: nil, assigned: false, fromOffer: false, canCraftAt: nil, isCrafted: false, text: nil, entities: nil, nameHidden: false))
++    return account.postbox.transaction { transaction -> Int in
++        let message = StoreMessage(peerId: peerId, namespace: Namespaces.Message.Local, customStableId: nil, globallyUniqueId: Int64.random(in: Int64.min ... Int64.max), groupingKey: nil, threadId: peerId == account.peerId ? account.peerId.toInt64() : nil, timestamp: timestamp, flags: [], tags: [], globalTags: [], localTags: [], forwardInfo: nil, authorId: account.peerId, text: asSurprise ? localSurpriseGiftSealedMarker : localSurpriseGiftOpenedMarker, attributes: [], media: [action])
++        let ids = transaction.addMessages([message], location: .Random)
++        if !ids.isEmpty {
++            updatePeerChatInclusionWithMinTimestamp(transaction: transaction, id: peerId, minTimestamp: timestamp, forceRootGroupIfNotExists: true)
++        }
++        return ids.count
++    }
++}
++
++func _internal_revealLocalSurpriseGift(account: Account, id: MessageId) -> Signal<Never, NoError> {
++    guard id.namespace == Namespaces.Message.Local else { return .complete() }
++    return account.postbox.transaction { transaction -> Void in
++        transaction.updateMessage(id, update: { message in
++            guard message.text == localSurpriseGiftSealedMarker else { return .skip }
++            return .update(StoreMessage(id: message.id, customStableId: nil, globallyUniqueId: message.globallyUniqueId, groupingKey: message.groupingKey, threadId: message.threadId, timestamp: message.timestamp, flags: StoreMessageFlags(message.flags), tags: message.tags, globalTags: message.globalTags, localTags: message.localTags, forwardInfo: message.forwardInfo.flatMap { StoreMessageForwardInfo($0) }, authorId: message.author?.id, text: localSurpriseGiftOpenedMarker, attributes: message.attributes, media: message.media))
++        })
++    } |> ignoreValues
++}
++
+ /// A widget message to insert locally (Debug Settings: the conformance set and the corpus into Saved Messages): the
+ /// widget's HTML, its size anchors and caption, and the reference pictures posted after it.
+ public struct EngineLocalWidgetPost: Equatable {
+diff --git a/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift b/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
+index 21020ed0aa5738453d683da1bd4e01b32ec95fa4..647d7c970344699fccfb854a3c50297adafe695d 100644
+--- a/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
++++ b/submodules/TelegramCore/Sources/TelegramEngine/Messages/TelegramEngineMessages.swift
+@@ -1106,6 +1106,14 @@ public extension TelegramEngine {
+             return _internal_debugInsertLocalWidgetMessages(account: self.account, peerId: peerId, posts: posts)
+         }
+ 
++        public func insertLocalSurpriseGift(peerId: EnginePeer.Id, gift: StarGift.UniqueGift, asSurprise: Bool) -> Signal<Int, NoError> {
++            return _internal_insertLocalSurpriseGift(account: self.account, peerId: peerId, gift: gift, asSurprise: asSurprise)
++        }
++
++        public func revealLocalSurpriseGift(id: EngineMessage.Id) -> Signal<Never, NoError> {
++            return _internal_revealLocalSurpriseGift(account: self.account, id: id)
++        }
++
+         /// widget-sandbox v0.2: polls the shared state of the widget `widgetId` (`messages.getWidgetPublicData`) while
+         /// subscribed, with `messageId` as a carrier: a subscription is one widget on screen that watches. A new state is
+         /// written into the stored widget of each registered message.
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/BUILD b/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/BUILD
+index ed9b47d98b9d5f51e7611261d19c60c8ffd1d3b3..5d5375a789ed38e62fd9a4e397d0640a32ab3b9f 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/BUILD
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/BUILD
+@@ -36,6 +36,9 @@ swift_library(
+         "//submodules/TelegramUI/Components/PeerInfo/PeerInfoCoverComponent",
+         "//submodules/TelegramUI/Components/Gifts/GiftItemComponent",
+         "//submodules/TextSelectionNode",
++        "//submodules/ConfettiEffect",
++        "//submodules/TelegramUI/Components/Gifts/GiftAnimationComponent",
++        "//submodules/TelegramUI/Components/Gifts/GiftSlotsComponent",
+     ],
+     visibility = [
+         "//visibility:public",
+diff --git a/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/Sources/ChatMessageGiftBubbleContentNode.swift b/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/Sources/ChatMessageGiftBubbleContentNode.swift
+index 38cbda40a890fedf2b55c3009ac19d99336d9ab8..3253991639d2e172541a5c6ba65d76a201bf4448 100644
+--- a/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/Sources/ChatMessageGiftBubbleContentNode.swift
++++ b/submodules/TelegramUI/Components/Chat/ChatMessageGiftBubbleContentNode/Sources/ChatMessageGiftBubbleContentNode.swift
+@@ -27,6 +27,9 @@ import InvisibleInkDustNode
+ import PeerInfoCoverComponent
+ import GiftItemComponent
+ import TextSelectionNode
++import ConfettiEffect
++import GiftAnimationComponent
++import GiftSlotsComponent
+ 
+ private func attributedServiceMessageString(theme: ChatPresentationThemeData, strings: PresentationStrings, nameDisplayOrder: PresentationPersonNameOrder, dateTimeFormat: PresentationDateTimeFormat, message: EngineMessage, accountPeerId: EnginePeer.Id) -> NSAttributedString? {
+     return universalServiceMessageString(presentationData: (theme.theme, theme.wallpaper), strings: strings, nameDisplayOrder: nameDisplayOrder, dateTimeFormat: dateTimeFormat, message: message, accountPeerId: accountPeerId, forChatList: false, forForumOverview: false, forAdditionalServiceMessage: true)
+@@ -92,6 +95,16 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+     private var absoluteRect: (CGRect, CGSize)?
+     
+     private var isPlaying: Bool = false
++    private var surpriseCycleStep: Int?
++    private var surpriseCycleMessageId: EngineMessage.Id?
++    private var surpriseVariants: [StarGift.UniqueGift.Attribute] = []
++    private let surpriseVariantsDisposable = MetaDisposable()
++    private let surpriseFinalPrefetchDisposable = MetaDisposable()
++    private var surpriseComposition: ComponentView<Empty>?
++    private var surpriseNeutralBackground: UIView?
++    private var surpriseCompositionMessageId: EngineMessage.Id?
++    private var surpriseCompositionVariants: [StarGift.UniqueGift.Attribute]?
++    private var surpriseTextReels: [String: ComponentView<Empty>] = [:]
+     
+     private var isExpanded: Bool = false
+     private var appliedIsExpanded: Bool = false
+@@ -297,6 +310,8 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+     
+     deinit {
+         self.fetchDisposable.dispose()
++        self.surpriseVariantsDisposable.dispose()
++        self.surpriseFinalPrefetchDisposable.dispose()
+         self.currentProgressDisposable?.dispose()
+     }
+     
+@@ -342,8 +357,60 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+         guard let item = self.item else {
+             return
+         }
++        guard self.surpriseCycleStep == nil else { return }
++        if item.message.id.namespace == Namespaces.Message.Local && item.message.text == localSurpriseGiftSealedMarker {
++            guard self.surpriseCycleStep == nil else { return }
++            if UIAccessibility.isReduceMotionEnabled {
++                let _ = item.context.engine.messages.revealLocalSurpriseGift(id: item.message.id).startStandalone()
++                return
++            }
++            guard let action = item.message.media.compactMap({ $0 as? TelegramMediaAction }).first, case let .starGiftUnique(gift, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _) = action.action, case let .unique(uniqueGift) = gift else { return }
++            self.surpriseCycleMessageId = item.message.id
++            self.surpriseCycleStep = 0
++            self.surpriseVariants = uniqueGift.attributes
++            if let file = uniqueGift.attributes.compactMap({ attribute -> TelegramMediaFile? in
++                if case let .model(_, file, _, _) = attribute { return file }
++                return nil
++            }).first {
++                self.surpriseFinalPrefetchDisposable.set(freeMediaFileResourceInteractiveFetched(postbox: item.context.account.postbox, userLocation: .other, fileReference: .standalone(media: file), resource: file.resource).start())
++            }
++            self.animationNode.playOnce()
++            self.surpriseVariantsDisposable.set((item.context.engine.payments.getStarGiftUpgradeAttributes(giftId: uniqueGift.giftId) |> take(1) |> deliverOnMainQueue).start(next: { [weak self] variants in
++                guard let self, self.surpriseCycleMessageId == item.message.id, let variants, !variants.isEmpty else { return }
++                self.surpriseVariants = variants
++            }))
++            self.advanceSurpriseCycle(messageId: item.message.id)
++            return
++        }
+         let _ = item.controllerInteraction.openMessage(item.message, OpenMessageParams(mode: .default, progress: self.makeProgress()))
+     }
++
++    private func advanceSurpriseCycle(messageId: EngineMessage.Id) {
++        guard self.surpriseCycleMessageId == messageId else { return }
++        guard let item = self.item, item.message.id == messageId, item.message.text == localSurpriseGiftSealedMarker, let step = self.surpriseCycleStep else {
++            self.surpriseCycleStep = nil
++            self.surpriseCycleMessageId = nil
++            self.surpriseVariantsDisposable.set(nil)
++            return
++        }
++        if step >= 24 {
++            // Keep the final cycling layout alive until the opened message is applied.
++            // Component callbacks can request a layout while the local transaction runs.
++            self.surpriseVariantsDisposable.set(nil)
++            if self.bounds.width > 0.0 && self.bounds.height > 0.0 {
++                self.view.addSubview(ConfettiView(frame: self.bounds))
++            }
++            let _ = (item.context.engine.messages.revealLocalSurpriseGift(id: messageId) |> deliverOnMainQueue).start(completed: {
++                let _ = item.controllerInteraction.requestMessageUpdate(messageId, false, ControlledTransition(duration: 0.35, curve: .easeInOut, interactive: false))
++            })
++            return
++        }
++        self.surpriseCycleStep = step + 1
++        let transition = step == 0 ? ControlledTransition(duration: 0.35, curve: .easeInOut, interactive: false) : nil
++        let _ = item.controllerInteraction.requestMessageUpdate(messageId, false, transition)
++        let delay = 0.09 + Double(step) * 0.009
++        Queue.mainQueue().after(delay) { [weak self] in self?.advanceSurpriseCycle(messageId: messageId) }
++    }
+     
+     private func expandPressed() {
+         self.isExpanded = !self.isExpanded
+@@ -541,6 +608,9 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+         let cachedMaskBackgroundImage = self.cachedMaskBackgroundImage
+         
+         let currentIsExpanded = self.isExpanded
++        let surpriseCycleStep = self.surpriseCycleStep
++        let surpriseCycleMessageId = self.surpriseCycleMessageId
++        let surpriseVariants = self.surpriseVariants
+         
+         let cachedTonImage = self.cachedTonImage
+         let cachedGiftMessageBackgroundImage = self.cachedGiftMessageBackgroundImage
+@@ -549,7 +619,9 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+             let contentProperties = ChatMessageBubbleContentProperties(hidesSimpleAuthorHeader: true, headerSpacing: 0.0, hidesBackground: .always, forceFullCorners: false, forceAlignment: .center)
+                         
+             return (contentProperties, nil, CGFloat.greatestFiniteMagnitude, { [weak self] constrainedSize, position in
+-                var giftSize = CGSize(width: 220.0, height: 240.0)
++                let isLocalDemoGift = item.message.id.namespace == Namespaces.Message.Local && (item.message.text == localSurpriseGiftSealedMarker || item.message.text == localSurpriseGiftOpenedMarker)
++                let requestedWidth: CGFloat = 220.0
++                var giftSize = CGSize(width: max(220.0, min(requestedWidth, constrainedSize.width - 12.0)), height: 240.0)
+                 
+                 let incoming: Bool
+                 if item.message.id.peerId == item.context.account.peerId && item.message.forwardInfo == nil {
+@@ -561,11 +633,15 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                 var attributedString = attributedServiceMessageString(theme: item.presentationData.theme, strings: item.presentationData.strings, nameDisplayOrder: item.presentationData.nameDisplayOrder, dateTimeFormat: item.presentationData.dateTimeFormat, message: EngineMessage(item.message), accountPeerId: item.context.account.peerId)
+             
+                 var primaryTextColor = serviceMessageColorComponents(theme: item.presentationData.theme.theme, wallpaper: item.presentationData.theme.wallpaper).primaryText
++                if item.message.id.namespace == Namespaces.Message.Local && (item.message.text == localSurpriseGiftSealedMarker || item.message.text == localSurpriseGiftOpenedMarker) {
++                    attributedString = NSAttributedString(string: "Демо · видно только вам", font: Font.regular(13.0), textColor: primaryTextColor, paragraphAlignment: .center)
++                }
+                                 
+                 var months: Int32 = 3
+                 var animationFile: TelegramMediaFile?
+                 var stickerPackAnimation: (reference: StickerPackReference, sourceId: String, file: TelegramMediaFile)?
+                 var uniqueGift: StarGift.UniqueGift?
++                var surpriseGift: StarGift.UniqueGift?
+                 var title = item.presentationData.strings.Notification_PremiumGift_Title
+                 var text = ""
+                 var subtitleColor = primaryTextColor
+@@ -929,6 +1005,48 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                                         break
+                                     }
+                                 }
++                                if item.message.id.namespace == Namespaces.Message.Local && (item.message.text == localSurpriseGiftSealedMarker || item.message.text == localSurpriseGiftOpenedMarker) {
++                                    ribbonTitle = "ДЕМО"
++                                    if item.message.text == localSurpriseGiftOpenedMarker {
++                                        surpriseGift = uniqueGiftValue
++                                    }
++                                    if item.message.text == localSurpriseGiftSealedMarker {
++                                        let revealedTitle = title
++                                        let revealedText = text
++                                        let revealedCreatorButtonTitle = creatorButtonTitle
++                                        title = "Подарок-сюрприз · Демо"
++                                        text = "Особенный сюрприз"
++                                        uniqueBackgroundColor = UIColor(rgb: 0x73877e)
++                                        uniqueSecondBackgroundColor = nil
++                                        uniquePatternColor = nil
++                                        uniquePatternFile = nil
++                                        buttonTitle = item.presentationData.strings.Notification_StarGift_Unpack
++                                        animationFile = nil
++                                        modelTitle = nil
++                                        modelValue = nil
++                                        backdropTitle = nil
++                                        backdropValue = nil
++                                        symbolTitle = nil
++                                        symbolValue = nil
++                                        creatorButtonTitle = ""
++                                        if surpriseCycleStep != nil, surpriseCycleMessageId == item.message.id {
++                                            surpriseGift = uniqueGiftValue
++                                            title = revealedTitle
++                                            text = revealedText
++                                            creatorButtonTitle = revealedCreatorButtonTitle
++                                            let models = surpriseVariants.compactMap { attribute -> String? in if case let .model(name, _, _, _) = attribute { return name }; return nil }
++                                            let backdrops = surpriseVariants.compactMap { attribute -> String? in if case let .backdrop(name, _, _, _, _, _, _) = attribute { return name }; return nil }
++                                            let symbols = surpriseVariants.compactMap { attribute -> String? in if case let .pattern(name, _, _) = attribute { return name }; return nil }
++                                            modelTitle = item.presentationData.strings.Notification_StarGift_Model
++                                            backdropTitle = item.presentationData.strings.Notification_StarGift_Backdrop
++                                            symbolTitle = item.presentationData.strings.Notification_StarGift_Symbol
++                                            modelValue = uniqueGiftValue.attributes.compactMap { if case let .model(name, _, _, _) = $0 { return name }; return nil }.first ?? models.first ?? "…"
++                                            backdropValue = uniqueGiftValue.attributes.compactMap { if case let .backdrop(name, _, _, _, _, _, _) = $0 { return name }; return nil }.first ?? backdrops.first ?? "…"
++                                            symbolValue = uniqueGiftValue.attributes.compactMap { if case let .pattern(name, _, _) = $0 { return name }; return nil }.first ?? symbols.first ?? "…"
++                                            buttonTitle = item.presentationData.strings.Notification_StarGift_View
++                                        }
++                                    }
++                                }
+                             } else if isRefunded, case let .generic(gift) = gift {
+                                 isStarGift = true
+                                 let authorName = item.message.author.flatMap { EnginePeer($0) }?.compactDisplayTitle ?? ""
+@@ -1257,6 +1375,59 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                             
+                             let imageFrame = CGRect(origin: CGPoint(x: floorToScreenPixels((boundingWidth - giftSize.width) / 2.0), y: hasServiceMessage ? labelLayout.size.height + 13.0 : 0.0), size: giftSize)
+                             let mediaBackgroundFrame = imageFrame.insetBy(dx: -2.0, dy: -2.0)
++                            let patternFrame = mediaBackgroundFrame.insetBy(dx: 4.0, dy: 4.0)
++
++                            let modelCount = surpriseVariants.reduce(0) { count, attribute in
++                                if case .model = attribute { return count + 1 }
++                                return count
++                            }
++                            let backdropCount = surpriseVariants.reduce(0) { count, attribute in if case .backdrop = attribute { return count + 1 }; return count }
++                            let patternCount = surpriseVariants.reduce(0) { count, attribute in if case .pattern = attribute { return count + 1 }; return count }
++                            let isOpenedSurprise = item.message.id.namespace == Namespaces.Message.Local && item.message.text == localSurpriseGiftOpenedMarker
++                            if isOpenedSurprise || strongSelf.surpriseCycleMessageId != item.message.id {
++                                strongSelf.surpriseCycleStep = nil
++                                strongSelf.surpriseCycleMessageId = nil
++                                strongSelf.surpriseVariantsDisposable.set(nil)
++                                strongSelf.surpriseFinalPrefetchDisposable.set(nil)
++                            }
++                            let canCycleComposition = surpriseCycleMessageId == item.message.id && modelCount > 1 && backdropCount > 1 && patternCount > 1
++                            let showSurpriseComposition = surpriseGift != nil && (isOpenedSurprise || canCycleComposition)
++                            if showSurpriseComposition, let surpriseGift {
++                                let step = isOpenedSurprise ? 24 : (surpriseCycleStep ?? 24)
++                                // Opened messages (including reload / Reduce Motion) use the same renderer.
++                                // An existing reel keeps its subject and selected model node when persisted.
++                                let hasExistingComposition = strongSelf.surpriseCompositionMessageId == item.message.id
++                                let compositionVariants: [StarGift.UniqueGift.Attribute]? = hasExistingComposition ? strongSelf.surpriseCompositionVariants : (canCycleComposition && !isOpenedSurprise ? surpriseVariants : nil)
++                                if strongSelf.surpriseCompositionMessageId != item.message.id {
++                                    strongSelf.surpriseComposition?.view?.removeFromSuperview()
++                                    strongSelf.surpriseComposition = ComponentView<Empty>()
++                                    strongSelf.surpriseCompositionMessageId = item.message.id
++                                    strongSelf.surpriseCompositionVariants = compositionVariants
++                                    if let compositionVariants {
++                                        let _ = strongSelf.surpriseComposition?.update(transition: .immediate, component: AnyComponent(GiftCompositionComponent(context: item.context, theme: item.presentationData.theme.theme, subject: .preview(compositionVariants), animationOffset: CGPoint(x: 0.0, y: -16.0), animationScale: 120.0 / 136.0, chatGeometry: true)), environment: {}, containerSize: patternFrame.size)
++                                    }
++                                }
++                                var revealed = Set<StarGift.UniqueGift.Attribute.AttributeType>()
++                                if step >= 14 { revealed.insert(.pattern) }
++                                if step >= 16 { revealed.insert(.backdrop) }
++                                if step >= 17 { revealed.insert(.model) }
++                                let _ = strongSelf.surpriseComposition?.update(transition: .immediate, component: AnyComponent(GiftCompositionComponent(context: item.context, theme: item.presentationData.theme.theme, subject: .unique(compositionVariants, surpriseGift), animationOffset: CGPoint(x: 0.0, y: -16.0), animationScale: 120.0 / 136.0, chatGeometry: true, revealedAttributes: revealed, requestUpdate: { [weak strongSelf] _ in
++                                    guard let strongSelf, let current = strongSelf.item, current.message.id == item.message.id else { return }
++                                    let _ = current.controllerInteraction.requestMessageUpdate(current.message.id, false, nil)
++                                })), environment: {}, containerSize: patternFrame.size)
++                                if let view = strongSelf.surpriseComposition?.view {
++                                    if view.superview == nil { strongSelf.view.insertSubview(view, belowSubview: strongSelf.titleNode.view) }
++                                    view.isUserInteractionEnabled = false
++                                    view.clipsToBounds = true
++                                    view.layer.cornerRadius = 20.0
++                                    animation.animator.updateFrame(layer: view.layer, frame: patternFrame, completion: nil)
++                                }
++                            } else {
++                                strongSelf.surpriseComposition?.view?.removeFromSuperview()
++                                strongSelf.surpriseComposition = nil
++                                strongSelf.surpriseCompositionMessageId = nil
++                                strongSelf.surpriseCompositionVariants = nil
++                            }
+                             
+                             let displayedAnimationFile = animationFile ?? stickerPackAnimation?.file
+                             let isStickerPackAnimation = animationFile == nil && stickerPackAnimation != nil
+@@ -1276,8 +1447,8 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                             }
+                             let animationFrame = CGRect(origin: CGPoint(x: mediaBackgroundFrame.minX + floorToScreenPixels((mediaBackgroundFrame.width - iconSize.width) / 2.0), y: mediaBackgroundFrame.minY - 16.0 + iconOffset), size: iconSize)
+                             strongSelf.animationNode.frame = animationFrame
+-                            strongSelf.animationNode.isHidden = isStoryEntity || animationSourceId == nil
+-                            strongSelf.placeholderNode.isHidden = animationSourceId == nil
++                            strongSelf.animationNode.isHidden = showSurpriseComposition || isStoryEntity || animationSourceId == nil
++                            strongSelf.placeholderNode.isHidden = showSurpriseComposition || animationSourceId == nil
+                             
+                             strongSelf.buttonNode.isHidden = buttonTitle.isEmpty
+                             strongSelf.buttonNode.isUserInteractionEnabled = !item.presentationData.isPreview || isGiftMessageComposerPreview
+@@ -1308,7 +1479,7 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                             if !isStoryEntity && uniqueGift == nil && strongSelf.currentAnimationSourceId != animationSourceId {
+                                 strongSelf.currentAnimationSourceId = animationSourceId
+                                 strongSelf.fetchDisposable.set(nil)
+-                                
++
+                                 if let file = displayedAnimationFile {
+                                     if isStickerPackAnimation {
+                                         strongSelf.animationNode.setup(source: AnimatedStickerResourceSource(account: item.context.account, resource: file.resource, isVideo: file.mimeType == "video/webm"), width: 384, height: 384, playbackMode: .still(.end), mode: .direct(cachePathPrefix: nil))
+@@ -1627,6 +1798,53 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                                 valueLayoutAndApply: symbolValueLayoutAndApply,
+                                 yOffset: 10.0 + attributeVerticalSpacing * 2
+                             )
++
++                            if let surpriseGift, let step = surpriseCycleStep, surpriseCycleMessageId == item.message.id, !isOpenedSurprise {
++                                func reel(_ key: String, target: UIView, parent: UIView, frame: CGRect, final: String, values: [String], color: UIColor, font: UIFont, stopAt: Int) {
++                                    let componentView: ComponentView<Empty>
++                                    if let current = strongSelf.surpriseTextReels[key] {
++                                        componentView = current
++                                    } else {
++                                        componentView = ComponentView<Empty>()
++                                        strongSelf.surpriseTextReels[key] = componentView
++                                    }
++                                    let candidates = (values.isEmpty ? [final] : values).enumerated().map { index, value in
++                                        AnyComponentWithIdentity<Empty>(id: index, component: AnyComponent(Text(text: value, font: font, color: color)))
++                                    }
++                                    let size = CGSize(width: max(1.0, frame.width), height: max(18.0, frame.height))
++                                    let _ = componentView.update(transition: .immediate, component: AnyComponent(SlotsComponent(item: AnyComponent(Text(text: final, font: font, color: color)), items: candidates, isAnimating: step < stopAt, motionBlur: false, size: size)), environment: {}, containerSize: size)
++                                    if let view = componentView.view {
++                                        if view.superview !== parent { parent.addSubview(view) }
++                                        view.isUserInteractionEnabled = false
++                                        view.clipsToBounds = true
++                                        view.frame = CGRect(origin: frame.origin, size: size)
++                                    }
++                                    target.alpha = 0.0
++                                }
++                                let models = surpriseVariants.compactMap { if case let .model(name, _, _, _) = $0 { return name }; return nil }
++                                let backdrops = surpriseVariants.compactMap { if case let .backdrop(name, _, _, _, _, _, _) = $0 { return name }; return nil }
++                                let symbols = surpriseVariants.compactMap { if case let .pattern(name, _, _) = $0 { return name }; return nil }
++                                let width = max(1.0, mediaBackgroundFrame.maxX - valueMinX - 12.0)
++                                let modelFrame = CGRect(x: valueMinX, y: strongSelf.modelValueTextNode.frame.minY, width: width, height: 18.0)
++                                let backdropFrame = CGRect(x: valueMinX, y: strongSelf.backdropValueTextNode.frame.minY, width: width, height: 18.0)
++                                let symbolFrame = CGRect(x: valueMinX, y: strongSelf.symbolValueTextNode.frame.minY, width: width, height: 18.0)
++                                reel("model", target: strongSelf.modelValueTextNode.view, parent: strongSelf.view, frame: modelFrame, final: modelValue ?? "", values: models, color: primaryTextColor, font: Font.semibold(13.0), stopAt: 17)
++                                reel("backdrop", target: strongSelf.backdropValueTextNode.view, parent: strongSelf.view, frame: backdropFrame, final: backdropValue ?? "", values: backdrops, color: primaryTextColor, font: Font.semibold(13.0), stopAt: 16)
++                                reel("symbol", target: strongSelf.symbolValueTextNode.view, parent: strongSelf.view, frame: symbolFrame, final: symbolValue ?? "", values: symbols, color: primaryTextColor, font: Font.semibold(13.0), stopAt: 14)
++                                let numberValues = (1 ... 24).map { "\(surpriseGift.title) #\(Int64(surpriseGift.number) + Int64($0 * 13))" }
++                                let finalNumber = "\(surpriseGift.title) #\(formatCollectibleNumber(surpriseGift.number, dateTimeFormat: item.presentationData.dateTimeFormat))"
++                                let numberFont = Font.semibold(13.0)
++                                let numberWidth = min(mediaBackgroundFrame.width - 20.0, max(subtitleFrame.width, numberValues.map { ($0 as NSString).size(withAttributes: [.font: numberFont]).width }.max() ?? 0.0) + 4.0)
++                                let numberFrame = CGRect(x: mediaBackgroundFrame.midX - numberWidth / 2.0, y: clippingTextFrame.minY, width: numberWidth, height: 18.0)
++                                reel("number", target: strongSelf.subtitleNode.textNode.view, parent: strongSelf.view, frame: numberFrame, final: finalNumber, values: numberValues, color: subtitleColor, font: numberFont, stopAt: 18)
++                            } else {
++                                for (_, reel) in strongSelf.surpriseTextReels { reel.view?.removeFromSuperview() }
++                                strongSelf.surpriseTextReels.removeAll()
++                                strongSelf.modelValueTextNode.alpha = 1.0
++                                strongSelf.backdropValueTextNode.alpha = 1.0
++                                strongSelf.symbolValueTextNode.alpha = 1.0
++                                strongSelf.subtitleNode.textNode.alpha = 1.0
++                            }
+  
+                             var buttonSize = CGSize(width: buttonTitleLayout.size.width + 38.0, height: 34.0)
+                             var buttonOriginY = clippingTextFrame.maxY + 10.0
+@@ -1689,7 +1907,7 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                             strongSelf.buttonContentNode.frame = CGRect(origin: .zero, size: buttonSize)
+                             
+                             if ribbonTextLayout.size.width > 0.0 {
+-                                if strongSelf.ribbonBackgroundNode.image == nil {
++                                if strongSelf.ribbonBackgroundNode.image == nil || isLocalDemoGift {
+                                     if let customRibbonColors {
+                                         strongSelf.ribbonBackgroundNode.image = generateGradientTintedImage(image: UIImage(bundleImageName: "Premium/GiftRibbon"), colors: customRibbonColors, direction: .mirroredDiagonal)
+                                     } else if let uniqueBackgroundColor {
+@@ -1780,7 +1998,7 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                                 }
+                             }
+                             
+-                            if let uniqueBackgroundColor, let uniqueSecondBackgroundColor, let uniquePatternColor, let uniquePatternFile {
++                            if !showSurpriseComposition, let uniqueBackgroundColor, let uniqueSecondBackgroundColor, let uniquePatternColor, let uniquePatternFile {
+                                 let patternInset: CGFloat = 4.0
+                                 let patternSize = CGSize(width: mediaBackgroundFrame.width - patternInset * 2.0, height: mediaBackgroundFrame.height - patternInset * 2.0)
+                                 let files: [Int64: TelegramMediaFile] = [uniquePatternFile.fileId.id: uniquePatternFile]
+@@ -1807,7 +2025,29 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+                                         strongSelf.view.insertSubview(backgroundView, belowSubview: strongSelf.titleNode.view)
+                                     }
+                                     backgroundView.frame = CGRect(origin: .zero, size: patternSize).offsetBy(dx: mediaBackgroundFrame.minX + patternInset, dy: mediaBackgroundFrame.minY + patternInset)
++                                    backgroundView.isHidden = false
+                                 }
++                            } else {
++                                strongSelf.patternView.view?.isHidden = true
++                            }
++                            if isLocalDemoGift && item.message.text == localSurpriseGiftSealedMarker && !showSurpriseComposition {
++                                let neutralBackground: UIView
++                                if let current = strongSelf.surpriseNeutralBackground {
++                                    neutralBackground = current
++                                } else {
++                                    neutralBackground = UIView()
++                                    neutralBackground.isUserInteractionEnabled = false
++                                    neutralBackground.backgroundColor = UIColor(white: 0.0, alpha: 0.12)
++                                    neutralBackground.layer.cornerRadius = 20.0
++                                    // Match the collectible backdrop's ordering: the sticker is
++                                    // above the title/subtitle, so inserting below it hides the text.
++                                    strongSelf.view.insertSubview(neutralBackground, belowSubview: strongSelf.titleNode.view)
++                                    strongSelf.surpriseNeutralBackground = neutralBackground
++                                }
++                                animation.animator.updateFrame(layer: neutralBackground.layer, frame: patternFrame, completion: nil)
++                            } else {
++                                strongSelf.surpriseNeutralBackground?.removeFromSuperview()
++                                strongSelf.surpriseNeutralBackground = nil
+                             }
+                             
+                             if let uniqueGift {
+@@ -2018,6 +2258,7 @@ public class ChatMessageGiftBubbleContentNode: ChatMessageBubbleContentNode {
+         }
+                 
+         let isPlaying = self.visibilityStatus == true
++        (self.surpriseComposition?.view as? GiftCompositionComponent.View)?.updateVisibility(isPlaying)
+         if self.isPlaying != isPlaying {
+             self.isPlaying = isPlaying
+             self.animationNode.visibility = isPlaying
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftAnimationComponent/Sources/GiftCompositionComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftAnimationComponent/Sources/GiftCompositionComponent.swift
+index 803ff034468e0c879007014f3e1a64d50bb6e001..454f3b03e3cd812440c988a93254138b5c7bbd0b 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftAnimationComponent/Sources/GiftCompositionComponent.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftAnimationComponent/Sources/GiftCompositionComponent.swift
+@@ -42,6 +42,7 @@ public final class GiftCompositionComponent: Component {
+     let animateScaleOnTransition: Bool
+     let alwaysAnimateTransition: Bool
+     let topBackgroundExtension: CGFloat
++    let chatGeometry: Bool
+     let revealedAttributes: Set<StarGift.UniqueGift.Attribute.AttributeType>
+     let externalState: ExternalState?
+     let requestUpdate: (ComponentTransition) -> Void
+@@ -56,6 +57,7 @@ public final class GiftCompositionComponent: Component {
+         animateScaleOnTransition: Bool = true,
+         alwaysAnimateTransition: Bool = false,
+         topBackgroundExtension: CGFloat = 0.0,
++        chatGeometry: Bool = false,
+         revealedAttributes: Set<StarGift.UniqueGift.Attribute.AttributeType> = Set(),
+         externalState: ExternalState? = nil,
+         requestUpdate: @escaping (ComponentTransition) -> Void = { _ in }
+@@ -69,6 +71,7 @@ public final class GiftCompositionComponent: Component {
+         self.animateScaleOnTransition = animateScaleOnTransition
+         self.alwaysAnimateTransition = alwaysAnimateTransition
+         self.topBackgroundExtension = topBackgroundExtension
++        self.chatGeometry = chatGeometry
+         self.revealedAttributes = revealedAttributes
+         self.externalState = externalState
+         self.requestUpdate = requestUpdate
+@@ -99,6 +102,9 @@ public final class GiftCompositionComponent: Component {
+         if lhs.topBackgroundExtension != rhs.topBackgroundExtension {
+             return false
+         }
++        if lhs.chatGeometry != rhs.chatGeometry {
++            return false
++        }
+         if lhs.revealedAttributes != rhs.revealedAttributes {
+             return false
+         }
+@@ -179,6 +185,7 @@ public final class GiftCompositionComponent: Component {
+         deinit {
+             self.disposables.dispose()
+             self.previewTimer?.invalidate()
++            self.spinLink?.invalidate()
+         }
+         
+         private var modelHidden = false
+@@ -188,6 +195,10 @@ public final class GiftCompositionComponent: Component {
+             self.animationNode?.view.isHidden = hidden
+         }
+ 
++        public func updateVisibility(_ visible: Bool) {
++            self.animationNode?.visibility = visible
++        }
++
+         @objc private func handleTap() {
+             guard let animationNode = animationNode as? DefaultAnimatedStickerNodeImpl else { return }
+             if case .once = animationNode.playbackMode, !animationNode.isPlaying {
+@@ -417,12 +428,11 @@ public final class GiftCompositionComponent: Component {
+                 duration: self.maxAnimDuration,
+                 delay: 0.05,
+                 timingFunction: kCAMediaTimingFunctionSpring,
+-                completion: { [weak self] _ in
+-                    guard let self, let container = self.decelContainer else {
++                completion: { [weak self, weak container] finished in
++                    guard finished, let self, let container, self.decelContainer === container else {
+                         return
+                     }
+-                    let _ = container
+-                    //self.handleDecelArrived(container: container, iconSize: iconSize, visualSize: visualSize)
++                    self.handleDecelArrived(container: container, iconSize: iconSize, visualSize: visualSize)
+                 }
+             )
+ 
+@@ -431,13 +441,10 @@ public final class GiftCompositionComponent: Component {
+         }
+ 
+         private func handleDecelArrived(container: UIView, iconSize: CGSize, visualSize: CGSize) {
+-            let isFinalIndex = self.decelItemHosts.count - 1
+-            guard isFinalIndex >= 0, let finalHostView = self.decelItemHosts.last else { return }
++            // The queue is reversed when built: the selected real model is the FIRST host.
++            guard let finalHostView = self.decelItemHosts.first else { return }
+ 
+             guard let node = self.animationNode as? DefaultAnimatedStickerNodeImpl else { return }
+-            node.playbackMode = .once
+-            node.visibility = true
+-
+             let finalCenterInSelf = container.convert(finalHostView.center, to: self)
+ 
+             let host = node.view
+@@ -450,24 +457,11 @@ public final class GiftCompositionComponent: Component {
+             self.decelContainer = nil
+             self.decelItemHosts.removeAll()
+             
+-            let factors: [CGFloat] = [1.0, 1.3, 0.92, 1.18, 0.98, 1.0]
+-            let values = factors.map { NSNumber(value: Double($0)) }
+-            let scaleAnim = CAKeyframeAnimation(keyPath: "transform.scale")
+-            scaleAnim.values = values
+-            scaleAnim.keyTimes = [0.0, 0.35, 0.55, 0.75, 0.9, 1.0].map(NSNumber.init)
+-            scaleAnim.timingFunctions = [
+-                CAMediaTimingFunction(name: .easeOut),
+-                CAMediaTimingFunction(name: .easeIn),
+-                CAMediaTimingFunction(name: .easeOut),
+-                CAMediaTimingFunction(name: .easeIn),
+-                CAMediaTimingFunction(name: .easeOut)
+-            ]
+-            scaleAnim.duration = 0.85
+-            scaleAnim.isRemovedOnCompletion = true
+-            host.layer.add(scaleAnim, forKey: "bounce")
+-
+-            node.playOnce()
++            // Keep the rendered frame and the bounce already running on this layer.
++            // Replaying here restarts the gift at precisely the reveal boundary.
+             self.finishSettled()
++            self.componentState?.updated(transition: .immediate)
++            self.component?.requestUpdate(.immediate)
+         }
+ 
+         private func tick() {
+@@ -816,7 +810,7 @@ public final class GiftCompositionComponent: Component {
+                 }
+                 let topBackgroundExtension = max(0.0, component.topBackgroundExtension)
+                 var avatarCenter = CGPoint(x: availableSize.width / 2.0, y: 104.0 + topBackgroundExtension)
+-                if let _ = component.animationScale {
++                if !component.chatGeometry, let _ = component.animationScale {
+                     avatarCenter = CGPoint(x: avatarCenter.x, y: 67.0 + topBackgroundExtension)
+                 }
+                 let backgroundSize = CGSize(width: availableSize.width, height: availableSize.height + topBackgroundExtension)
+@@ -829,9 +823,9 @@ public final class GiftCompositionComponent: Component {
+                         isDark: false,
+                         avatarCenter: avatarCenter,
+                         avatarScale: 1.0,
+-                        defaultHeight: 300.0,
++                        defaultHeight: component.chatGeometry ? availableSize.height : 300.0,
+                         topBackgroundExtension: topBackgroundExtension,
+-                        gradientOnTop: true,
++                        gradientOnTop: !component.chatGeometry,
+                         avatarTransitionFraction: 0.0,
+                         patternTransitionFraction: 0.0
+                     )),
+@@ -941,6 +935,11 @@ public final class GiftCompositionComponent: Component {
+                     )
+                 }
+ 
++                if self.spinState == .settled, let animationNode = self.animationNode {
++                    transition.setPosition(layer: animationNode.layer, position: CGPoint(x: availableSize.width / 2.0 + (component.animationOffset?.x ?? 0.0), y: 88.0 + (component.animationOffset?.y ?? 0.0)))
++                    transition.setScale(layer: animationNode.layer, scale: scaleValue)
++                }
++
+                 return availableSize
+             }
+ 
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/BUILD b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/BUILD
+index 5804b8f4743c325543fb67cf5dbfc02cdc4008be..35e35b9863a162df73237722398a370e1ebfe7a0 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/BUILD
++++ b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/BUILD
+@@ -10,6 +10,7 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/Gifts/GiftItemComponent",
+         "//submodules/AsyncDisplayKit",
+         "//submodules/Display",
+         "//submodules/TelegramCore",
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoScreen.swift b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoScreen.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..c3d0f67b51ee1fb87cd7dd160393645f5fbbc8af
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoScreen.swift
+@@ -0,0 +1,232 @@
++import Foundation
++import UIKit
++import AsyncDisplayKit
++import Display
++import AccountContext
++import ComponentFlow
++import TelegramCore
++import TelegramPresentationData
++import PresentationDataUtils
++import GiftItemComponent
++import LottieComponent
++
++/// Explicitly local preview. It never invokes the confirmation's real transfer closure.
++public final class SurpriseGiftDemoScreen: ViewController {
++    private let context: AccountContext
++    private let gift: StarGift.UniqueGift
++    private let recipient: EnginePeer
++    private let automaticallySend: Bool
++    private let scrollView = UIScrollView()
++    private let card = UIView()
++    private let titleLabel = UILabel()
++    private let detailLabel = UILabel()
++    private let noticeLabel = UILabel()
++    private let actionButton = UIButton(type: .system)
++    private let sendButton = UIButton(type: .system)
++    private let giftView = ComponentView<Empty>()
++    private let boxView = ComponentView<Empty>()
++    private let playBox = ActionSlot<Void>()
++    private var store: SurpriseGiftDemoStore?
++    private var delivery: SurpriseGiftDemoStore.Delivery?
++    private let requestId = UUID()
++    private var revealAnimator: UIViewPropertyAnimator?
++    private var contentWidth: CGFloat = 0
++
++    public init(context: AccountContext, gift: StarGift.UniqueGift, recipient: EnginePeer, automaticallySend: Bool = false) {
++        self.context = context
++        self.gift = gift
++        self.recipient = recipient
++        self.automaticallySend = automaticallySend
++        let presentationData = context.sharedContext.currentPresentationData.with { $0 }
++        super.init(navigationBarPresentationData: NavigationBarPresentationData(presentationData: presentationData))
++        self.title = "Surprise Gift · Demo"
++        self.navigationItem.leftBarButtonItem = UIBarButtonItem(title: presentationData.strings.Common_Close, style: .plain, target: self, action: #selector(closePressed))
++    }
++
++    required public init(coder aDecoder: NSCoder) {
++        fatalError("init(coder:) has not been implemented")
++    }
++
++    override public func loadDisplayNode() {
++        self.displayNode = ASDisplayNode()
++        let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
++        self.displayNode.backgroundColor = presentationData.theme.list.blocksBackgroundColor
++        self.displayNode.view.addSubview(self.scrollView)
++        self.scrollView.addSubview(self.noticeLabel)
++        self.scrollView.addSubview(self.card)
++        self.scrollView.addSubview(self.sendButton)
++        self.card.backgroundColor = UIColor(rgb: 0x34464f)
++        self.card.layer.cornerRadius = 24
++        self.titleLabel.font = Font.semibold(20)
++        self.titleLabel.textColor = .white
++        self.titleLabel.textAlignment = .center
++        self.titleLabel.numberOfLines = 2
++        self.detailLabel.font = Font.regular(16)
++        self.detailLabel.textColor = UIColor.white.withAlphaComponent(0.8)
++        self.detailLabel.textAlignment = .center
++        self.detailLabel.numberOfLines = 0
++        self.noticeLabel.font = Font.regular(14)
++        self.noticeLabel.textAlignment = .center
++        self.noticeLabel.numberOfLines = 0
++        self.noticeLabel.textColor = presentationData.theme.list.itemSecondaryTextColor
++        self.noticeLabel.text = "Demo Mode · local recipient preview\nNo gifts, Stars or ownership are transferred."
++        self.actionButton.titleLabel?.font = Font.semibold(17)
++        self.actionButton.tintColor = .white
++        self.actionButton.backgroundColor = UIColor.black.withAlphaComponent(0.18)
++        self.actionButton.layer.cornerRadius = 22
++        self.actionButton.addTarget(self, action: #selector(actionPressed), for: .touchUpInside)
++        self.sendButton.titleLabel?.font = Font.semibold(17)
++        self.sendButton.setTitle("Send as a Surprise · Demo", for: .normal)
++        self.sendButton.tintColor = presentationData.theme.list.itemAccentColor
++        self.sendButton.addTarget(self, action: #selector(sendPressed), for: .touchUpInside)
++        self.card.addSubview(self.titleLabel)
++        self.card.addSubview(self.detailLabel)
++        self.card.addSubview(self.actionButton)
++        do {
++            let root = try FileManager.default.url(for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
++            let url = root.appendingPathComponent("SurpriseGiftDemo/\(self.context.account.peerId.toInt64())/deliveries.json")
++            let store = try SurpriseGiftDemoStore(url: url)
++            self.store = store
++            if self.automaticallySend {
++                self.delivery = try store.send(requestId: self.requestId, sender: String(self.context.account.peerId.toInt64()), recipient: self.recipientKey, gift: self.demoGift)
++            } else {
++                self.delivery = store.deliveries(for: self.recipientKey).last(where: { $0.gift.id == self.gift.slug })
++            }
++        } catch {
++            self.noticeLabel.text = "Demo storage could not be read. Your existing data has been preserved."
++            self.sendButton.isEnabled = false
++        }
++        self.render()
++    }
++
++    private var recipientKey: String {
++        return String(self.recipient.id.toInt64())
++    }
++
++    private var demoGift: SurpriseGiftDemoStore.Gift {
++        var model = "—"
++        var backdrop = "—"
++        var symbol = "—"
++        for attribute in self.gift.attributes {
++            switch attribute {
++            case let .model(name, _, _, _): model = name
++            case let .backdrop(name, _, _, _, _, _, _): backdrop = name
++            case let .pattern(name, _, _): symbol = name
++            case .originalInfo: break
++            }
++        }
++        return SurpriseGiftDemoStore.Gift(id: self.gift.slug, title: "\(self.gift.title) #\(self.gift.number)", model: model, backdrop: backdrop, symbol: symbol)
++    }
++
++    @objc private func closePressed() {
++        self.revealAnimator?.stopAnimation(true)
++        self.dismiss()
++    }
++
++    override public func viewDidDisappear(_ animated: Bool) {
++        super.viewDidDisappear(animated)
++        self.revealAnimator?.stopAnimation(true)
++        self.revealAnimator = nil
++        self.render()
++    }
++
++    @objc private func sendPressed() {
++        guard self.store != nil else { return }
++        let data = self.context.sharedContext.currentPresentationData.with { $0 }
++        let name = self.recipient.displayTitle(strings: data.strings, displayOrder: data.nameDisplayOrder)
++        let alert = UIAlertController(title: "Confirm Demo Delivery", message: "Create a local surprise for \(name)? This does not transfer your collectible or spend Stars.", preferredStyle: .alert)
++        alert.addAction(UIAlertAction(title: data.strings.Common_Cancel, style: .cancel))
++        alert.addAction(UIAlertAction(title: "Send Demo", style: .default, handler: { [weak self] _ in
++            guard let self, let store = self.store else { return }
++            do {
++                self.delivery = try store.send(requestId: self.requestId, sender: String(self.context.account.peerId.toInt64()), recipient: self.recipientKey, gift: self.demoGift)
++                self.render()
++            } catch {
++                self.showError()
++            }
++        }))
++        self.present(alert, animated: true)
++    }
++
++    @objc private func actionPressed() {
++        guard let delivery = self.delivery, let store = self.store, self.revealAnimator == nil else { return }
++        if delivery.opened {
++            let gift = delivery.gift
++            let alert = UIAlertController(title: gift.title, message: "Model: \(gift.model)\nBackdrop: \(gift.backdrop)\nSymbol: \(gift.symbol)\n\nLocal Demo · ownership unchanged", preferredStyle: .alert)
++            alert.addAction(UIAlertAction(title: "Close", style: .default))
++            self.present(alert, animated: true)
++            return
++        }
++        do {
++            self.delivery = try store.unwrap(id: delivery.id, recipient: self.recipientKey)
++        } catch {
++            self.showError()
++            return
++        }
++        if UIAccessibility.isReduceMotionEnabled {
++            self.render()
++            return
++        }
++        self.actionButton.isEnabled = false
++        self.playBox.invoke(Void())
++        let animator = UIViewPropertyAnimator(duration: 1.2, curve: .easeInOut) { [weak self] in
++            self?.boxView.view?.alpha = 0
++            self?.boxView.view?.transform = CGAffineTransform(scaleX: 1.2, y: 1.2)
++            self?.giftView.view?.alpha = 1
++        }
++        animator.addCompletion { [weak self] _ in
++            self?.revealAnimator = nil
++            self?.render()
++        }
++        self.revealAnimator = animator
++        animator.startAnimation()
++    }
++
++    private func showError() {
++        let alert = UIAlertController(title: "Demo could not be saved", message: "The operation was not completed. Try again after checking available storage.", preferredStyle: .alert)
++        alert.addAction(UIAlertAction(title: "OK", style: .default))
++        self.present(alert, animated: true)
++    }
++
++    private func render() {
++        let opened = self.delivery?.opened == true
++        self.titleLabel.text = self.delivery == nil ? self.demoGift.title : "Gift from you"
++        self.detailLabel.text = opened ? "\(self.demoGift.title)\n\nModel  \(self.demoGift.model)\nBackdrop  \(self.demoGift.backdrop)\nSymbol  \(self.demoGift.symbol)" : (self.delivery == nil ? "Choose Send as a Surprise to create a local delivery." : "Special surprise")
++        self.actionButton.setTitle(opened ? "View" : "Unwrap", for: .normal)
++        self.actionButton.isHidden = self.delivery == nil
++        self.actionButton.isEnabled = true
++        self.sendButton.isHidden = self.delivery != nil
++        self.boxView.view?.transform = .identity
++        self.boxView.view?.alpha = self.delivery != nil && !opened ? 1 : 0
++        self.giftView.view?.alpha = self.delivery == nil || opened ? 1 : 0
++    }
++
++    override public func containerLayoutUpdated(_ layout: ContainerViewLayout, transition: ContainedViewLayoutTransition) {
++        super.containerLayoutUpdated(layout, transition: transition)
++        let top = self.navigationLayout(layout: layout).navigationFrame.maxY
++        self.scrollView.frame = CGRect(x: layout.safeInsets.left, y: top, width: layout.size.width - layout.safeInsets.left - layout.safeInsets.right, height: layout.size.height - top)
++        let width = self.scrollView.bounds.width
++        self.noticeLabel.frame = CGRect(x: 16, y: 12, width: width - 32, height: 54)
++        let cardWidth = min(303, width - 40)
++        self.card.frame = CGRect(x: (width - cardWidth) / 2, y: 82, width: cardWidth, height: 450)
++        self.titleLabel.frame = CGRect(x: 12, y: 202, width: cardWidth - 24, height: 52)
++        self.detailLabel.frame = CGRect(x: 12, y: 258, width: cardWidth - 24, height: 126)
++        self.actionButton.frame = CGRect(x: (cardWidth - 112) / 2, y: 394, width: 112, height: 44)
++        self.sendButton.frame = CGRect(x: 16, y: 548, width: width - 32, height: 50)
++        self.scrollView.contentSize = CGSize(width: width, height: 614 + layout.intrinsicInsets.bottom)
++        if self.contentWidth != cardWidth {
++            self.contentWidth = cardWidth
++            let data = self.context.sharedContext.currentPresentationData.with { $0 }
++            let size = CGSize(width: 180, height: 180)
++            let _ = self.giftView.update(transition: .immediate, component: AnyComponent(GiftItemComponent(context: self.context, theme: data.theme, strings: data.strings, subject: .uniqueGift(gift: self.gift, price: nil), mode: .thumbnail)), environment: {}, containerSize: size)
++            let _ = self.boxView.update(transition: .immediate, component: AnyComponent(LottieComponent(content: LottieComponent.AppBundleContent(name: "GiftUnpack"), startingPosition: .begin, size: size, playOnce: self.playBox)), environment: {}, containerSize: size)
++            for component in [self.giftView, self.boxView] {
++                if let view = component.view {
++                    if view.superview == nil { self.card.insertSubview(view, at: 0) }
++                    view.frame = CGRect(x: (cardWidth - 180) / 2, y: 16, width: 180, height: 180)
++                }
++            }
++            if self.revealAnimator == nil { self.render() }
++        }
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoStore.swift b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoStore.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..572dc756249cd351208fa93c353f18cdb53e5534
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftDemoScreen/Sources/SurpriseGiftDemoStore.swift
+@@ -0,0 +1,130 @@
++import Foundation
++
++/// Local-only prototype domain. Does not call Telegram payments or transfer APIs.
++/// UI integration must use a separate demo entry point and identify it as Demo Mode.
++public final class SurpriseGiftDemoStore {
++    public struct Gift: Codable, Equatable {
++        public let id: String
++        public let title: String
++        public let model: String
++        public let backdrop: String
++        public let symbol: String
++
++        public init(id: String, title: String, model: String, backdrop: String, symbol: String) {
++            self.id = id
++            self.title = title
++            self.model = model
++            self.backdrop = backdrop
++            self.symbol = symbol
++        }
++    }
++
++    public struct Delivery: Codable, Equatable {
++        public let id: UUID
++        public let sender: String
++        public let recipient: String
++        public let gift: Gift
++        public private(set) var opened: Bool
++
++        fileprivate init(id: UUID, sender: String, recipient: String, gift: Gift) {
++            self.id = id
++            self.sender = sender
++            self.recipient = recipient
++            self.gift = gift
++            self.opened = false
++        }
++
++        fileprivate mutating func reveal() {
++            self.opened = true
++        }
++    }
++
++    public enum StoreError: Error {
++        case invalidParticipants
++        case unknownDelivery
++        case wrongRecipient
++        case conflictingRequest
++        case unsupportedVersion
++    }
++
++    private struct Archive: Codable {
++        let version: Int
++        var deliveries: [Delivery]
++    }
++
++    private let url: URL
++    private let lock = NSLock()
++    private var archive: Archive
++
++    /// Caller supplies an account-scoped application-support URL, never Postbox.
++    /// Corrupt/unsupported data is surfaced to the caller, never silently replaced.
++    public init(url: URL) throws {
++        self.url = url
++        if FileManager.default.fileExists(atPath: url.path) {
++            self.archive = try JSONDecoder().decode(Archive.self, from: Data(contentsOf: url))
++            guard self.archive.version == 1 else {
++                throw StoreError.unsupportedVersion
++            }
++        } else {
++            self.archive = Archive(version: 1, deliveries: [])
++        }
++    }
++
++    public func deliveries(for participant: String) -> [Delivery] {
++        self.lock.lock()
++        defer { self.lock.unlock() }
++        return self.archive.deliveries.filter { $0.sender == participant || $0.recipient == participant }
++    }
++
++    /// Call only after confirmation. Cancellation creates no delivery.
++    /// Reuse the confirmation's request ID to make repeated taps idempotent.
++    @discardableResult
++    public func send(requestId: UUID, sender: String, recipient: String, gift: Gift) throws -> Delivery {
++        self.lock.lock()
++        defer { self.lock.unlock() }
++        guard !sender.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++              !recipient.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
++              sender != recipient else {
++            throw StoreError.invalidParticipants
++        }
++        if let delivery = self.archive.deliveries.first(where: { $0.id == requestId }) {
++            guard delivery.sender == sender, delivery.recipient == recipient, delivery.gift == gift else {
++                throw StoreError.conflictingRequest
++            }
++            return delivery
++        }
++        let delivery = Delivery(id: requestId, sender: sender, recipient: recipient, gift: gift)
++        var next = self.archive
++        next.deliveries.append(delivery)
++        try self.commit(next)
++        return delivery
++    }
++
++    /// Persist before playing the reveal. Animation is transient: restarting or
++    /// recycling a cell must render the durable revealed state, not replay it.
++    @discardableResult
++    public func unwrap(id: UUID, recipient: String) throws -> Delivery {
++        self.lock.lock()
++        defer { self.lock.unlock() }
++        guard let index = self.archive.deliveries.firstIndex(where: { $0.id == id }) else {
++            throw StoreError.unknownDelivery
++        }
++        guard self.archive.deliveries[index].recipient == recipient else {
++            throw StoreError.wrongRecipient
++        }
++        if self.archive.deliveries[index].opened {
++            return self.archive.deliveries[index]
++        }
++        var next = self.archive
++        next.deliveries[index].reveal()
++        try self.commit(next)
++        return next.deliveries[index]
++    }
++
++    private func commit(_ next: Archive) throws {
++        let data = try JSONEncoder().encode(next)
++        try FileManager.default.createDirectory(at: self.url.deletingLastPathComponent(), withIntermediateDirectories: true)
++        try data.write(to: self.url, options: .atomic)
++        self.archive = next
++    }
++}
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/BUILD b/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/BUILD
+new file mode 100644
+index 0000000000000000000000000000000000000000..fb9d11cad26ccf63021576ee3a3a094c18c90bcf
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/BUILD
+@@ -0,0 +1,14 @@
++load("@build_bazel_rules_swift//swift:swift.bzl", "swift_library")
++
++swift_library(
++    name = "GiftSlotsComponent",
++    module_name = "GiftSlotsComponent",
++    srcs = glob(["Sources/**/*.swift"]),
++    copts = ["-warnings-as-errors"],
++    deps = [
++        "//submodules/Display",
++        "//submodules/ComponentFlow",
++        "//submodules/ImageBlur",
++    ],
++    visibility = ["//visibility:public"],
++)
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/Sources/SlotsComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/Sources/SlotsComponent.swift
+new file mode 100644
+index 0000000000000000000000000000000000000000..9f194451ea63b744c5fe2fa95a63fc8e488e272a
+--- /dev/null
++++ b/submodules/TelegramUI/Components/Gifts/GiftSlotsComponent/Sources/SlotsComponent.swift
+@@ -0,0 +1,457 @@
++import Foundation
++import UIKit
++import Display
++import ComponentFlow
++import ImageBlur
++
++private let additionalInset: CGFloat = 4.0
++private let maskInset: CGFloat = 8.0
++
++public final class SlotsComponent<ChildEnvironment: Equatable>: Component {
++    public typealias EnvironmentType = ChildEnvironment
++
++    private let item: AnyComponent<ChildEnvironment>
++    private let items: [AnyComponentWithIdentity<ChildEnvironment>]
++    private let isAnimating: Bool
++    private let tintColor: UIColor?
++    private let verticalOffset: CGFloat
++    private let motionBlur: Bool
++    private let size: CGSize
++    
++    public init(
++        item: AnyComponent<ChildEnvironment>,
++        items: [AnyComponentWithIdentity<ChildEnvironment>],
++        isAnimating: Bool,
++        tintColor: UIColor? = nil,
++        verticalOffset: CGFloat = 0.0,
++        motionBlur: Bool = true,
++        size: CGSize
++    ) {
++        self.item = item
++        self.items = items
++        self.isAnimating = isAnimating
++        self.tintColor = tintColor
++        self.verticalOffset = verticalOffset
++        self.motionBlur = motionBlur
++        self.size = size
++    }
++
++    public static func == (lhs: SlotsComponent<ChildEnvironment>, rhs: SlotsComponent<ChildEnvironment>) -> Bool {
++        if lhs.item != rhs.item {
++            return false
++        }
++        if lhs.items != rhs.items {
++            return false
++        }
++        if lhs.isAnimating != rhs.isAnimating {
++            return false
++        }
++        if lhs.tintColor != rhs.tintColor {
++            return false
++        }
++        if lhs.verticalOffset != rhs.verticalOffset {
++            return false
++        }
++        if lhs.motionBlur != rhs.motionBlur {
++            return false
++        }
++        if lhs.size != rhs.size {
++            return false
++        }
++        return true
++    }
++
++    public final class View: UIView {
++        private var itemViews: [AnyHashable: ComponentView<ChildEnvironment>] = [:]
++        private var motionBlurLayers: [AnyHashable: SimpleLayer] = [:]
++        private var order: [AnyHashable] = []
++
++        private let containerView = UIView()
++        private let maskLayer = SimpleGradientLayer()
++
++        private enum SpinState {
++            case idle
++            case spinning
++            case decelerating
++            case settled
++        }
++
++        private var spinState: SpinState = .idle
++        private var isAnimating = false
++        private var animationLink: SharedDisplayLinkDriver.Link?
++
++        private var currentIds = Set<AnyHashable>()
++        private var lastSpawnTime: Double?
++        private var currentInterval: Double = 0.09
++        
++        private var motionBlurFactor: CGFloat = 1.0
++        private var decelQueue: [AnyComponentWithIdentity<ChildEnvironment>] = []
++        private var decelTotalSteps: Int = 0
++        private var decelStepIndex: Int = 0
++        
++        private let minSpawnInterval: Double = 0.10
++        private let maxSpawnInterval: Double = 0.80
++        
++        private let baseAnimDuration: Double = 0.18
++        private let maxAnimDuration: Double  = 0.5
++        
++        private var component: SlotsComponent?
++        private var environment: Environment<ChildEnvironment>?
++        private var availableSize: CGSize?
++        
++        @inline(__always) private func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
++        @inline(__always) private func clamp01(_ x: Double) -> Double { max(0.0, min(1.0, x)) }
++
++        override init(frame: CGRect) {
++            super.init(frame: frame)
++            self.addSubview(self.containerView)
++
++            self.containerView.clipsToBounds = true
++
++            self.maskLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
++            self.maskLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
++
++            let fade: CGFloat = 0.2
++            self.maskLayer.locations = [0.0, NSNumber(value: Float(fade)), NSNumber(value: Float(1.0 - fade)), 1.0]
++            self.maskLayer.colors = [
++                UIColor.black.withAlphaComponent(0.0).cgColor,
++                UIColor.black.withAlphaComponent(1.0).cgColor,
++                UIColor.black.withAlphaComponent(1.0).cgColor,
++                UIColor.black.withAlphaComponent(0.0).cgColor
++            ]
++            self.containerView.layer.mask = self.maskLayer
++        }
++
++        required init?(coder: NSCoder) {
++            fatalError("init(coder:) has not been implemented")
++        }
++
++        private func spawnRandomSlot(availableSize: CGSize) {
++            guard var items = self.component?.items, !items.isEmpty else { return }
++            items = items.filter { !self.currentIds.contains($0.id) }
++            guard let randomItem = items.randomElement() else { return }
++
++            self.spawnSlot(item: randomItem, availableSize: availableSize) {}
++        }
++
++        private func spawnSlot(
++            item: AnyComponentWithIdentity<ChildEnvironment>,
++            isFinal: Bool = false,
++            availableSize: CGSize,
++            animDuration: Double? = nil,
++            completion: @escaping () -> Void
++        ) {
++            guard let component = self.component, let environment = self.environment else { return }
++
++            self.currentIds.insert(item.id)
++            self.lastSpawnTime = CACurrentMediaTime()
++
++            let itemView = self.itemViews[item.id] ?? ComponentView<ChildEnvironment>()
++            self.itemViews[item.id] = itemView
++
++            let size = itemView.update(
++                transition: .immediate,
++                component: item.component,
++                environment: { environment[ChildEnvironment.self] },
++                containerSize: availableSize
++            )
++            if let view = itemView.view {
++                if view.superview == nil {
++                    if let tintColor = component.tintColor {
++                        view.layer.layerTintColor = tintColor.cgColor
++                    }
++                    view.layer.allowsGroupOpacity = true
++                    self.containerView.addSubview(view)
++                }
++                view.frame = CGRect(origin: CGPoint(x: 0.0, y: -size.height - additionalInset), size: size)
++                
++                let travelDistance = (size.height + maskInset + additionalInset) * 2.0
++                let pitch = (size.height + additionalInset)
++                
++                if isFinal {
++                    var finalFrame = view.frame
++                    finalFrame.origin.y = maskInset
++                    view.frame = finalFrame
++                    
++                    let fromY = size.height + maskInset + additionalInset
++                    let overshoot: CGFloat = 7.0
++                    
++                    let anim = CAKeyframeAnimation(keyPath: "position.y")
++                    anim.isAdditive = true
++                    anim.values = [ fromY, -overshoot, 0.0 ]
++                    anim.keyTimes = [0.0, 0.7, 1.0]
++                    anim.timingFunctions = [
++                        CAMediaTimingFunction(name: .easeOut),
++                        CAMediaTimingFunction(name: .easeInEaseOut)
++                    ]
++                    anim.duration = 0.5
++                    
++                    CATransaction.begin()
++                    CATransaction.setCompletionBlock {
++                        completion()
++                        self.currentIds.remove(item.id)
++                        self.finishSettled()
++                    }
++                    view.layer.add(anim, forKey: "finalOvershoot")
++                    CATransaction.commit()
++                }
++                else {
++                    let duration: Double = animDuration ?? baseAnimDuration
++                    
++                    view.layer.animatePosition(
++                        from: CGPoint(x: 0.0, y: (size.height + maskInset + additionalInset) * 2.0),
++                        to: .zero,
++                        duration: duration,
++                        timingFunction: CAMediaTimingFunctionName.linear.rawValue,
++                        additive: true,
++                        completion: { _ in
++                            completion()
++                            self.currentIds.remove(item.id)
++                        }
++                    )
++                    
++                    let intervalForConstantSpacing = Double(pitch / travelDistance) * duration
++                    self.currentInterval = intervalForConstantSpacing
++                }
++            }
++
++            self.setMotionBlurFactor(id: item.id, factor: self.motionBlurFactor, transition: .immediate)
++        }
++
++        private func setMotionBlurFactor(id: AnyHashable, factor: CGFloat, transition: ComponentTransition) {
++            guard let component = self.component, component.motionBlur, let itemView = self.itemViews[id]?.view else {
++                return
++            }
++
++            if factor != 0.0 {
++                let motionBlurLayer: SimpleLayer
++                if let current = self.motionBlurLayers[id] {
++                    motionBlurLayer = current
++                } else {
++                    motionBlurLayer = SimpleLayer()
++
++                    let image = generateImage(itemView.bounds.size, rotatedContext: { size, context in
++                        UIGraphicsPushContext(context)
++                        defer { UIGraphicsPopContext() }
++                        context.clear(CGRect(origin: CGPoint(), size: size))
++                        itemView.layer.render(in: context)
++                    })
++                    if let image {
++                        motionBlurLayer.contents = verticalBlurredImage(image, radius: 8.0)?.cgImage
++                    }
++                    motionBlurLayer.contentsScale = itemView.layer.contentsScale
++                    self.motionBlurLayers[id] = motionBlurLayer
++                    itemView.layer.addSublayer(motionBlurLayer)
++
++                    motionBlurLayer.position = CGPoint(x: itemView.bounds.size.width * 0.5, y: itemView.bounds.size.height * 0.5)
++                    motionBlurLayer.bounds = CGRect(origin: CGPoint(), size: itemView.bounds.size)
++                    
++                    if let tintColor = component.tintColor {
++                        motionBlurLayer.layerTintColor = tintColor.cgColor
++                    }
++                }
++                
++                let scaleFactor = 1.0 * (1.0 - factor) + 1.25 * factor
++                let opacityFactor =  1.0 * (1.0 - factor) + 0.6 * factor
++                transition.setTransform(layer: motionBlurLayer, transform: CATransform3DMakeScale(1.0, scaleFactor, 1.0))
++                transition.setAlpha(layer: itemView.layer, alpha: opacityFactor)
++            } else if let motionBlurLayer = self.motionBlurLayers[id] {
++                self.motionBlurLayers.removeValue(forKey: id)
++                transition.setAlpha(layer: motionBlurLayer, alpha: 0.0, completion: { [weak motionBlurLayer] _ in
++                    motionBlurLayer?.removeFromSuperlayer()
++                })
++                transition.setTransform(layer: motionBlurLayer, transform: CATransform3DIdentity)
++            }
++        }
++
++        private func beginSpinning() {
++            self.spinState = .spinning
++            self.isAnimating = true
++            self.motionBlurFactor = 1.0
++            self.currentInterval = 0.1
++
++            self.ensureDisplayLink()
++        }
++
++        private func beginDeceleration() {
++            guard let component = self.component, self.spinState == .spinning || self.spinState == .decelerating else { return }
++
++            self.spinState = .decelerating
++            self.isAnimating = false
++
++            var queue: [AnyComponentWithIdentity<ChildEnvironment>] = []
++            if !component.items.isEmpty {
++                let shuffled = Array(component.items.shuffled().prefix(3))
++                queue.append(contentsOf: shuffled)
++            }
++            queue.append(AnyComponentWithIdentity(id: "final", component: component.item))
++            
++            self.decelQueue = queue
++            self.decelTotalSteps = queue.count
++            self.decelStepIndex = 0
++            
++            self.motionBlurFactor = max(self.motionBlurFactor, 0.0001)
++
++            self.ensureDisplayLink()
++        }
++
++        private func ensureDisplayLink() {
++            guard self.animationLink == nil else {
++                return
++            }
++            self.animationLink = SharedDisplayLinkDriver.shared.add(framesPerSecond: .max, { [weak self] _ in
++                self?.tick()
++            })
++        }
++
++        private func invalidateDisplayLinkIfIdle() {
++            if self.spinState == .idle || self.spinState == .settled {
++                self.animationLink?.invalidate()
++                self.animationLink = nil
++            }
++        }
++        
++        private func applyEdge3DSquish() {
++            let H = self.containerView.bounds.height
++            guard H > 0 else { return }
++
++            CATransaction.begin()
++            CATransaction.setDisableActions(true)
++            for (_, cv) in self.itemViews {
++                guard let v = cv.view, v.superview === self.containerView else { continue }
++                let midY = liveMidY(in: self.containerView, of: v)
++                let scaleY = edgeScaleY(for: midY, containerHeight: H)
++                var t = CATransform3DIdentity
++                t = CATransform3DScale(t, 1.0, scaleY, 1.0)
++                v.layer.transform = t
++            }
++            CATransaction.commit()
++        }
++
++        private func tick() {
++            guard let availableSize = self.availableSize else {
++                return
++            }
++            let now = CACurrentMediaTime()
++
++            switch self.spinState {
++            case .spinning:
++                if let last = self.lastSpawnTime, now - last >= self.currentInterval || self.lastSpawnTime == nil {
++                    self.spawnRandomSlot(availableSize: availableSize)
++                }
++            case .decelerating:
++                let t = clamp01(self.decelTotalSteps > 1 ? Double(self.decelStepIndex) / Double(self.decelTotalSteps - 1) : 1.0)
++                                
++                if let last = self.lastSpawnTime, now - last >= self.currentInterval {
++                    if !self.decelQueue.isEmpty {
++                        let next = self.decelQueue.removeFirst()
++                        let isFinal = self.decelQueue.isEmpty
++                        let animDuration = isFinal ? nil : lerp(baseAnimDuration, maxAnimDuration, t)
++                        self.spawnSlot(item: next, isFinal: isFinal, availableSize: availableSize, animDuration: animDuration, completion: {})
++                        
++                        self.motionBlurFactor = CGFloat(1.0 - t)
++
++                        self.decelStepIndex += 1
++                    }
++                } else if self.lastSpawnTime == nil {
++                    if !self.decelQueue.isEmpty {
++                        let next = self.decelQueue.removeFirst()
++                        self.spawnSlot(item: next, availableSize: availableSize) {}
++                    }
++                }
++
++            case .settled, .idle:
++                self.invalidateDisplayLinkIfIdle()
++            }
++            
++            self.applyEdge3DSquish()
++        }
++
++        private func finishSettled() {
++            for (id, _) in self.motionBlurLayers {
++                self.setMotionBlurFactor(id: id, factor: 0.0, transition: .easeInOut(duration: 0.2))
++            }
++            self.motionBlurLayers.removeAll()
++
++            self.spinState = .settled
++            self.decelQueue.removeAll()
++            self.invalidateDisplayLinkIfIdle()
++        }
++
++        func update(
++            component: SlotsComponent,
++            availableSize: CGSize,
++            state: EmptyComponentState,
++            environment: Environment<ChildEnvironment>,
++            transition: ComponentTransition
++        ) -> CGSize {
++            self.component = component
++            self.environment = environment
++            self.availableSize = availableSize
++
++            let size = component.size
++            self.containerView.frame = CGRect(origin: CGPoint(x: 0.0, y: component.verticalOffset), size: size).insetBy(dx: 0.0, dy: -maskInset)
++            self.maskLayer.frame = CGRect(origin: .zero, size: self.containerView.bounds.size)
++
++            let wasAnimating = self.isAnimating
++            let nowAnimating = component.isAnimating
++
++            if nowAnimating && !wasAnimating {
++                self.beginSpinning()
++                self.spawnRandomSlot(availableSize: availableSize)
++            } else if !nowAnimating && wasAnimating {
++                self.beginDeceleration()
++            } else if nowAnimating && self.spinState == .settled {
++                self.beginSpinning()
++                self.spawnRandomSlot(availableSize: availableSize)
++            }
++            
++            if let tintColor = component.tintColor {
++                for (id, itemView) in self.itemViews {
++                    if let itemLayer = itemView.view?.layer {
++                        transition.setTintColor(layer: itemLayer, color: tintColor)
++                    }
++                    if let blurLayer = self.motionBlurLayers[id] {
++                        transition.setTintColor(layer: blurLayer, color: tintColor)
++                    }
++                }
++            }
++
++            return size
++        }
++    }
++
++    public func makeView() -> View {
++        return View()
++    }
++
++    public func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
++        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
++    }
++}
++
++private let minScaleYAtEdge: CGFloat = 0.7
++private let squishFalloff: CGFloat = 0.12
++
++private func smoothstep(_ x: CGFloat) -> CGFloat {
++    let t = max(0.0, min(1.0, x))
++    return t * t * (3.0 - 2.0 * t)
++}
++
++private func liveMidY(in container: UIView, of view: UIView) -> CGFloat {
++    if let pres = view.layer.presentation() {
++        let p = container.layer.convert(pres.position, from: view.layer.superlayer)
++        return p.y
++    }
++    return view.center.y
++}
++
++private func edgeScaleY(for midY: CGFloat, containerHeight H: CGFloat) -> CGFloat {
++    guard H > 0 else { return 1.0 }
++    let d = abs((midY - H * 0.5) / (H * 0.5))
++    let uRaw = (d - squishFalloff) / (1.0 - squishFalloff)
++    let u = smoothstep(max(0.0, min(1.0, uRaw)))
++    return (1.0 - u) + minScaleYAtEdge * u
++}
++
++
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD
+index 90f2380a27c4982fdb1c3fa62b5bf70c81e51cdb..8a452b8ea223c2197df083c396daa3cb4035c046 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/BUILD
+@@ -10,6 +10,8 @@ swift_library(
+         "-warnings-as-errors",
+     ],
+     deps = [
++        "//submodules/TelegramUI/Components/Gifts/GiftDemoScreen",
++        "//submodules/TelegramUI/Components/Gifts/GiftSlotsComponent",
+         "//submodules/AsyncDisplayKit",
+         "//submodules/Display",
+         "//submodules/TelegramCore",
+@@ -69,6 +71,7 @@ swift_library(
+         "//submodules/TelegramUI/Components/AvatarComponent",
+         "//submodules/TelegramUI/Components/AlertComponent/AlertTransferHeaderComponent",
+         "//submodules/TelegramUI/Components/AlertComponent/AlertTableComponent",
++        "//submodules/TelegramUI/Components/AlertComponent/AlertCheckComponent",
+         "//submodules/TelegramUI/Components/AlertComponent/AlertInputFieldComponent",
+         "//submodules/WalletContext",
+         "//submodules/PhoneNumberFormat",
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftTransferAlertController.swift b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftTransferAlertController.swift
+index 26ffd523911ed956e5f4008082dab45b937e9bc5..161266aa76e8e117474e74f156f6cd61411376e3 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftTransferAlertController.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftTransferAlertController.swift
+@@ -1,4 +1,5 @@
+ import Foundation
++import GiftDemoScreen
+ import UIKit
+ import AsyncDisplayKit
+ import Display
+@@ -17,6 +18,7 @@ import TableComponent
+ import AvatarComponent
+ import AlertTransferHeaderComponent
+ import AlertTableComponent
++import AlertCheckComponent
+ 
+ public func giftTransferAlertController(
+     context: AccountContext,
+@@ -24,6 +26,8 @@ public func giftTransferAlertController(
+     peer: EnginePeer,
+     transferStars: Int64,
+     navigationController: NavigationController?,
++    isDemo: Bool = false,
++    demoCommit: ((Bool) -> Void)? = nil,
+     commit: @escaping () -> Void
+ ) -> AlertScreen {
+     let presentationData = context.sharedContext.currentPresentationData.with { $0 }
+@@ -32,7 +36,10 @@ public func giftTransferAlertController(
+     let title = strings.Gift_Transfer_Confirmation_Title
+     let text: String
+     let buttonText: String
+-    if transferStars > 0 {
++    if isDemo {
++        text = "Демо: отправить \(gift.title) #\(gift.number) пользователю \(peer.displayTitle(strings: strings, displayOrder: presentationData.nameDisplayOrder))? Звёзды не списываются, подарок не передаётся."
++        buttonText = "Отправить · 25 ★"
++    } else if transferStars > 0 {
+         text = strings.Gift_Transfer_Confirmation_Text("\(gift.title) #\(formatCollectibleNumber(gift.number, dateTimeFormat: presentationData.dateTimeFormat))", peer.displayTitle(strings: strings, displayOrder: presentationData.nameDisplayOrder), strings.Gift_Transfer_Confirmation_Text_Stars(Int32(clamping: transferStars))).string
+         buttonText = "\(strings.Gift_Transfer_Confirmation_Transfer)  $  \(transferStars)"
+     } else {
+@@ -174,20 +181,35 @@ public func giftTransferAlertController(
+         )
+     ))
+     
++    let surpriseState = AlertCheckComponent.ExternalState()
++    if isDemo {
++        content.append(AnyComponentWithIdentity(id: "surprise", component: AnyComponent(AlertCheckComponent(title: "Отправить как сюрприз", alignment: .default, initialValue: false, externalState: surpriseState))))
++    }
++    var actions: [AlertScreen.Action] = [
++        .init(title: buttonText, type: .default, action: {
++            if isDemo, let demoCommit {
++                demoCommit(surpriseState.value)
++            } else {
++                commit()
++            }
++        })
++    ]
++    if !isDemo, ProcessInfo.processInfo.arguments.contains("--surprise-gifts-demo"), let navigationController {
++        actions.append(.init(title: "Surprise Gift · Demo", type: .default, action: { [weak navigationController] in
++            navigationController?.pushViewController(SurpriseGiftDemoScreen(context: context, gift: gift, recipient: peer))
++        }))
++    }
++    actions.append(.init(title: strings.Common_Cancel))
++
+     let alertController = ChatMessagePaymentAlertController(
+         context: context,
+         presentationData: presentationData,
+         configuration: AlertScreen.Configuration(actionAlignment: .vertical, dismissOnOutsideTap: true, allowInputInset: false),
+         content: content,
+-        actions: [
+-            .init(title: buttonText, type: .default, action: {
+-                commit()
+-            }),
+-            .init(title: strings.Common_Cancel)
+-        ],
++        actions: actions,
+         navigationController: navigationController,
+         chatPeerId: context.account.peerId,
+-        showBalance: transferStars > 0
++        showBalance: !isDemo && transferStars > 0
+     )
+         
+     var dismissAllTooltipsImpl: (() -> Void)?
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift
+index a960aed34402c333c60db235c892c61f19a60b4b..64a1bf43b8c53f8ce76555c8bdb246bf2f0620df 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/GiftViewScreen.swift
+@@ -34,7 +34,9 @@ import PremiumLockButtonSubtitleComponent
+ import StarsBalanceOverlayComponent
+ import BalanceNeededScreen
+ import GiftItemComponent
++import GiftDemoScreen
+ import GiftAnimationComponent
++import GiftSlotsComponent
+ import ChatThemeScreen
+ import ProfileLevelRatingBarComponent
+ import AnimatedTextComponent
+@@ -1779,6 +1781,52 @@ private final class GiftViewSheetContent: CombinedComponent {
+             })
+         }
+         
++        func demoPurchaseKey(gift: StarGift.UniqueGift) -> String {
++            return "surpriseGiftDemo.purchase.\(self.context.account.peerId.toInt64()).\(gift.slug)"
++        }
++
++        func purchaseSurpriseDemo(gift: StarGift.UniqueGift, price: String) {
++            guard let controller = self.getController() as? GiftViewScreen else { return }
++            if UserDefaults.standard.bool(forKey: self.demoPurchaseKey(gift: gift)) {
++                self.startSurpriseDemo(gift: gift)
++                return
++            }
++            let presentationData = self.context.sharedContext.currentPresentationData.with { $0 }
++            let alert = textAlertController(context: self.context, title: "Демо-покупка", text: "Купить \(gift.title) #\(gift.number) за \(price)? Это локальное демо: баланс и владелец подарка не изменятся.", actions: [
++                TextAlertAction(type: .genericAction, title: presentationData.strings.Common_Cancel, action: {}),
++                TextAlertAction(type: .defaultAction, title: "Купить · Демо", action: { [weak self] in
++                    guard let self else { return }
++                    UserDefaults.standard.set(true, forKey: self.demoPurchaseKey(gift: gift))
++                    self.updated()
++                    self.startSurpriseDemo(gift: gift)
++                })
++            ])
++            controller.present(alert, in: .window(.root))
++        }
++
++        func startSurpriseDemo(gift: StarGift.UniqueGift) {
++            guard let controller = self.getController() as? GiftViewScreen, let navigationController = controller.navigationController as? NavigationController else { return }
++            let context = self.context
++            let selector = context.sharedContext.makePeerSelectionController(PeerSelectionControllerParams(context: context, filter: [.excludeRecent, .doNotSearchMessages], requestPeerType: [.user(.init(isBot: false, isPremium: nil))], hasContactSelector: false, hasCreation: false))
++            selector.peerSelected = { [weak selector, weak navigationController] peer, _ in
++                guard let navigationController else { return }
++                let alert = giftTransferAlertController(context: context, gift: gift, peer: peer, transferStars: 25, navigationController: navigationController, isDemo: true, demoCommit: { [weak selector, weak navigationController] asSurprise in
++                    let _ = (context.engine.messages.insertLocalSurpriseGift(peerId: peer.id, gift: gift, asSurprise: asSurprise) |> deliverOnMainQueue).start(next: { [weak selector, weak navigationController] count in
++                        guard count > 0, let navigationController else { return }
++                        selector?.dismiss()
++                        Queue.mainQueue().after(0.4) {
++                            context.sharedContext.navigateToChatController(NavigateToChatControllerParams(navigationController: navigationController, chatController: nil, context: context, chatLocation: .peer(peer), subject: nil, botStart: nil, updateTextInputState: nil, keepStack: .always, useExisting: true, purposefulAction: nil, scrollToEndIfExists: true, activateMessageSearch: nil, animated: true))
++                        }
++                    })
++                }, commit: {})
++                (navigationController.viewControllers.last as? ViewController)?.present(alert, in: .window(.root))
++            }
++            self.dismiss(animated: true)
++            Queue.mainQueue().after(0.4) { [weak navigationController] in
++                navigationController?.pushViewController(selector)
++            }
++        }
++
+         func transferGift() {
+             if let arguments = self.subject.arguments, case let .unique(gift) = arguments.gift, self.isMyWalletGift(gift) {
+                 self.depositGift(gift)
+@@ -2176,7 +2224,7 @@ private final class GiftViewSheetContent: CombinedComponent {
+                 }
+                 var items: [ContextMenuItem] = []
+                 let strings = presentationData.strings
+-                
++
+                 if let reference = arguments.reference, case .unique = arguments.gift, let togglePinnedToTop = controller.togglePinnedToTop, let pinnedToTop = arguments.pinnedToTop {
+                     items.append(.action(ContextMenuActionItem(text: pinnedToTop ? strings.PeerInfo_Gifts_Context_Unpin : strings.PeerInfo_Gifts_Context_Pin , icon: { theme in generateTintedImage(image: UIImage(bundleImageName: pinnedToTop ? "Chat/Context Menu/Unpin" : "Chat/Context Menu/Pin"), color: theme.contextMenu.primaryColor) }, action: { [weak self, weak controller] c, f in
+                         c?.dismiss(completion: { [weak self, weak controller] in
+@@ -6058,7 +6106,13 @@ private final class GiftViewSheetContent: CombinedComponent {
+                 }
+                 buyString += "  \(currencySymbol) \(currencyAmount)"
+                 
+-                let buttonTitle = subject.arguments?.upgradeStars != nil ? strings.Gift_Upgrade_Confirm : buyString
++                let isDemoPurchase = ProcessInfo.processInfo.arguments.contains("--surprise-gifts-demo") && uniqueGift != nil
++                let buttonTitle: String
++                if isDemoPurchase, let uniqueGift {
++                    buttonTitle = UserDefaults.standard.bool(forKey: state.demoPurchaseKey(gift: uniqueGift)) ? "Отправить · Демо" : "Купить · Демо  \(currencySymbol) \(currencyAmount)"
++                } else {
++                    buttonTitle = subject.arguments?.upgradeStars != nil ? strings.Gift_Upgrade_Confirm : buyString
++                }
+                 let buttonAttributedString = NSMutableAttributedString(string: buttonTitle, font: Font.semibold(17.0), textColor: theme.list.itemCheckColors.foregroundColor, paragraphAlignment: .center)
+                 
+                 
+@@ -6098,7 +6152,12 @@ private final class GiftViewSheetContent: CombinedComponent {
+                         isEnabled: true,
+                         displaysProgress: state.inProgress,
+                         action: { [weak state] in
+-                            state?.commitBuy()
++                            if isDemoPurchase, let uniqueGift {
++                                let unit = resellAmount.currency == .ton ? "TON" : "звёзд"
++                                state?.purchaseSurpriseDemo(gift: uniqueGift, price: "\(currencyAmount) \(unit)")
++                            } else {
++                                state?.commitBuy()
++                            }
+                         })
+             } else {
+                 buttonComponent = ButtonComponent(
+diff --git a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/SlotsComponent.swift b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/SlotsComponent.swift
+index 93d348a966b470e6381e8a36e7b52ad92e13b591..200251590e02f7a88b483d6f2dc8c057d5630df2 100644
+--- a/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/SlotsComponent.swift
++++ b/submodules/TelegramUI/Components/Gifts/GiftViewScreen/Sources/SlotsComponent.swift
+@@ -1,459 +1,6 @@
+ import Foundation
+ import UIKit
+-import Display
+ import ComponentFlow
+-import ImageBlur
+-
+-private let additionalInset: CGFloat = 4.0
+-private let maskInset: CGFloat = 8.0
+-
+-final class SlotsComponent<ChildEnvironment: Equatable>: Component {
+-    public typealias EnvironmentType = ChildEnvironment
+-
+-    private let item: AnyComponent<ChildEnvironment>
+-    private let items: [AnyComponentWithIdentity<ChildEnvironment>]
+-    private let isAnimating: Bool
+-    private let tintColor: UIColor?
+-    private let verticalOffset: CGFloat
+-    private let motionBlur: Bool
+-    private let size: CGSize
+-    
+-    public init(
+-        item: AnyComponent<ChildEnvironment>,
+-        items: [AnyComponentWithIdentity<ChildEnvironment>],
+-        isAnimating: Bool,
+-        tintColor: UIColor? = nil,
+-        verticalOffset: CGFloat = 0.0,
+-        motionBlur: Bool = true,
+-        size: CGSize
+-    ) {
+-        self.item = item
+-        self.items = items
+-        self.isAnimating = isAnimating
+-        self.tintColor = tintColor
+-        self.verticalOffset = verticalOffset
+-        self.motionBlur = motionBlur
+-        self.size = size
+-    }
+-
+-    public static func == (lhs: SlotsComponent<ChildEnvironment>, rhs: SlotsComponent<ChildEnvironment>) -> Bool {
+-        if lhs.item != rhs.item {
+-            return false
+-        }
+-        if lhs.items != rhs.items {
+-            return false
+-        }
+-        if lhs.isAnimating != rhs.isAnimating {
+-            return false
+-        }
+-        if lhs.tintColor != rhs.tintColor {
+-            return false
+-        }
+-        if lhs.verticalOffset != rhs.verticalOffset {
+-            return false
+-        }
+-        if lhs.motionBlur != rhs.motionBlur {
+-            return false
+-        }
+-        if lhs.size != rhs.size {
+-            return false
+-        }
+-        return true
+-    }
+-
+-    public final class View: UIView {
+-        private var itemViews: [AnyHashable: ComponentView<ChildEnvironment>] = [:]
+-        private var motionBlurLayers: [AnyHashable: SimpleLayer] = [:]
+-        private var order: [AnyHashable] = []
+-
+-        private let containerView = UIView()
+-        private let maskLayer = SimpleGradientLayer()
+-
+-        private enum SpinState {
+-            case idle
+-            case spinning
+-            case decelerating
+-            case settled
+-        }
+-
+-        private var spinState: SpinState = .idle
+-        private var isAnimating = false
+-        private var animationLink: SharedDisplayLinkDriver.Link?
+-
+-        private var currentIds = Set<AnyHashable>()
+-        private var lastSpawnTime: Double?
+-        private var currentInterval: Double = 0.09
+-        
+-        private var motionBlurFactor: CGFloat = 1.0
+-        private var decelQueue: [AnyComponentWithIdentity<ChildEnvironment>] = []
+-        private var decelTotalSteps: Int = 0
+-        private var decelStepIndex: Int = 0
+-        
+-        private let minSpawnInterval: Double = 0.10
+-        private let maxSpawnInterval: Double = 0.80
+-        
+-        private let baseAnimDuration: Double = 0.18
+-        private let maxAnimDuration: Double  = 0.5
+-        
+-        private var component: SlotsComponent?
+-        private var environment: Environment<ChildEnvironment>?
+-        private var availableSize: CGSize?
+-        
+-        @inline(__always) private func lerp(_ a: Double, _ b: Double, _ t: Double) -> Double { a + (b - a) * t }
+-        @inline(__always) private func clamp01(_ x: Double) -> Double { max(0.0, min(1.0, x)) }
+-
+-        override init(frame: CGRect) {
+-            super.init(frame: frame)
+-            self.addSubview(self.containerView)
+-
+-            self.containerView.clipsToBounds = true
+-
+-            self.maskLayer.startPoint = CGPoint(x: 0.5, y: 0.0)
+-            self.maskLayer.endPoint = CGPoint(x: 0.5, y: 1.0)
+-
+-            let fade: CGFloat = 0.2
+-            self.maskLayer.locations = [0.0, NSNumber(value: Float(fade)), NSNumber(value: Float(1.0 - fade)), 1.0]
+-            self.maskLayer.colors = [
+-                UIColor.black.withAlphaComponent(0.0).cgColor,
+-                UIColor.black.withAlphaComponent(1.0).cgColor,
+-                UIColor.black.withAlphaComponent(1.0).cgColor,
+-                UIColor.black.withAlphaComponent(0.0).cgColor
+-            ]
+-            self.containerView.layer.mask = self.maskLayer
+-        }
+-
+-        required init?(coder: NSCoder) {
+-            fatalError("init(coder:) has not been implemented")
+-        }
+-
+-        private func spawnRandomSlot(availableSize: CGSize) {
+-            guard var items = self.component?.items, !items.isEmpty else { return }
+-            items = items.filter { !self.currentIds.contains($0.id) }
+-            guard let randomItem = items.randomElement() else { return }
+-
+-            self.spawnSlot(item: randomItem, availableSize: availableSize) {}
+-        }
+-
+-        private func spawnSlot(
+-            item: AnyComponentWithIdentity<ChildEnvironment>,
+-            isFinal: Bool = false,
+-            availableSize: CGSize,
+-            animDuration: Double? = nil,
+-            completion: @escaping () -> Void
+-        ) {
+-            guard let component = self.component, let environment = self.environment else { return }
+-
+-            self.currentIds.insert(item.id)
+-            self.lastSpawnTime = CACurrentMediaTime()
+-
+-            let itemView = self.itemViews[item.id] ?? ComponentView<ChildEnvironment>()
+-            self.itemViews[item.id] = itemView
+-
+-            let size = itemView.update(
+-                transition: .immediate,
+-                component: item.component,
+-                environment: { environment[ChildEnvironment.self] },
+-                containerSize: availableSize
+-            )
+-            if let view = itemView.view {
+-                if view.superview == nil {
+-                    if let tintColor = component.tintColor {
+-                        view.layer.layerTintColor = tintColor.cgColor
+-                    }
+-                    view.layer.allowsGroupOpacity = true
+-                    self.containerView.addSubview(view)
+-                }
+-                view.frame = CGRect(origin: CGPoint(x: 0.0, y: -size.height - additionalInset), size: size)
+-                
+-                let travelDistance = (size.height + maskInset + additionalInset) * 2.0
+-                let pitch = (size.height + additionalInset)
+-                
+-                if isFinal {
+-                    var finalFrame = view.frame
+-                    finalFrame.origin.y = maskInset
+-                    view.frame = finalFrame
+-                    
+-                    let fromY = size.height + maskInset + additionalInset
+-                    let overshoot: CGFloat = 7.0
+-                    
+-                    let anim = CAKeyframeAnimation(keyPath: "position.y")
+-                    anim.isAdditive = true
+-                    anim.values = [ fromY, -overshoot, 0.0 ]
+-                    anim.keyTimes = [0.0, 0.7, 1.0]
+-                    anim.timingFunctions = [
+-                        CAMediaTimingFunction(name: .easeOut),
+-                        CAMediaTimingFunction(name: .easeInEaseOut)
+-                    ]
+-                    anim.duration = 0.5
+-                    
+-                    CATransaction.begin()
+-                    CATransaction.setCompletionBlock {
+-                        completion()
+-                        self.currentIds.remove(item.id)
+-                        self.finishSettled()
+-                    }
+-                    view.layer.add(anim, forKey: "finalOvershoot")
+-                    CATransaction.commit()
+-                }
+-                else {
+-                    let duration: Double = animDuration ?? baseAnimDuration
+-                    
+-                    view.layer.animatePosition(
+-                        from: CGPoint(x: 0.0, y: (size.height + maskInset + additionalInset) * 2.0),
+-                        to: .zero,
+-                        duration: duration,
+-                        timingFunction: CAMediaTimingFunctionName.linear.rawValue,
+-                        additive: true,
+-                        completion: { _ in
+-                            completion()
+-                            self.currentIds.remove(item.id)
+-                        }
+-                    )
+-                    
+-                    let intervalForConstantSpacing = Double(pitch / travelDistance) * duration
+-                    self.currentInterval = intervalForConstantSpacing
+-                }
+-            }
+-
+-            self.setMotionBlurFactor(id: item.id, factor: self.motionBlurFactor, transition: .immediate)
+-        }
+-
+-        private func setMotionBlurFactor(id: AnyHashable, factor: CGFloat, transition: ComponentTransition) {
+-            guard let component = self.component, component.motionBlur, let itemView = self.itemViews[id]?.view else {
+-                return
+-            }
+-
+-            if factor != 0.0 {
+-                let motionBlurLayer: SimpleLayer
+-                if let current = self.motionBlurLayers[id] {
+-                    motionBlurLayer = current
+-                } else {
+-                    motionBlurLayer = SimpleLayer()
+-
+-                    let image = generateImage(itemView.bounds.size, rotatedContext: { size, context in
+-                        UIGraphicsPushContext(context)
+-                        defer { UIGraphicsPopContext() }
+-                        context.clear(CGRect(origin: CGPoint(), size: size))
+-                        itemView.layer.render(in: context)
+-                    })
+-                    if let image {
+-                        motionBlurLayer.contents = verticalBlurredImage(image, radius: 8.0)?.cgImage
+-                    }
+-                    motionBlurLayer.contentsScale = itemView.layer.contentsScale
+-                    self.motionBlurLayers[id] = motionBlurLayer
+-                    itemView.layer.addSublayer(motionBlurLayer)
+-
+-                    motionBlurLayer.position = CGPoint(x: itemView.bounds.size.width * 0.5, y: itemView.bounds.size.height * 0.5)
+-                    motionBlurLayer.bounds = CGRect(origin: CGPoint(), size: itemView.bounds.size)
+-                    
+-                    if let tintColor = component.tintColor {
+-                        motionBlurLayer.layerTintColor = tintColor.cgColor
+-                    }
+-                }
+-                
+-                let scaleFactor = 1.0 * (1.0 - factor) + 1.25 * factor
+-                let opacityFactor =  1.0 * (1.0 - factor) + 0.6 * factor
+-                transition.setTransform(layer: motionBlurLayer, transform: CATransform3DMakeScale(1.0, scaleFactor, 1.0))
+-                transition.setAlpha(layer: itemView.layer, alpha: opacityFactor)
+-            } else if let motionBlurLayer = self.motionBlurLayers[id] {
+-                self.motionBlurLayers.removeValue(forKey: id)
+-                transition.setAlpha(layer: motionBlurLayer, alpha: 0.0, completion: { [weak motionBlurLayer] _ in
+-                    motionBlurLayer?.removeFromSuperlayer()
+-                })
+-                transition.setTransform(layer: motionBlurLayer, transform: CATransform3DIdentity)
+-            }
+-        }
+-
+-        private func beginSpinning() {
+-            self.spinState = .spinning
+-            self.isAnimating = true
+-            self.motionBlurFactor = 1.0
+-            self.currentInterval = 0.1
+-
+-            self.ensureDisplayLink()
+-        }
+-
+-        private func beginDeceleration() {
+-            guard let component = self.component, self.spinState == .spinning || self.spinState == .decelerating else { return }
+-
+-            self.spinState = .decelerating
+-            self.isAnimating = false
+-
+-            var queue: [AnyComponentWithIdentity<ChildEnvironment>] = []
+-            if !component.items.isEmpty {
+-                let shuffled = Array(component.items.shuffled().prefix(3))
+-                queue.append(contentsOf: shuffled)
+-            }
+-            queue.append(AnyComponentWithIdentity(id: "final", component: component.item))
+-            
+-            self.decelQueue = queue
+-            self.decelTotalSteps = queue.count
+-            self.decelStepIndex = 0
+-            
+-            self.motionBlurFactor = max(self.motionBlurFactor, 0.0001)
+-
+-            self.ensureDisplayLink()
+-        }
+-
+-        private func ensureDisplayLink() {
+-            guard self.animationLink == nil else {
+-                return
+-            }
+-            self.animationLink = SharedDisplayLinkDriver.shared.add(framesPerSecond: .max, { [weak self] _ in
+-                self?.tick()
+-            })
+-        }
+-
+-        private func invalidateDisplayLinkIfIdle() {
+-            if self.spinState == .idle || self.spinState == .settled {
+-                self.animationLink?.invalidate()
+-                self.animationLink = nil
+-            }
+-        }
+-        
+-        private func applyEdge3DSquish() {
+-            let H = self.containerView.bounds.height
+-            guard H > 0 else { return }
+-
+-            CATransaction.begin()
+-            CATransaction.setDisableActions(true)
+-            for (_, cv) in self.itemViews {
+-                guard let v = cv.view, v.superview === self.containerView else { continue }
+-                let midY = liveMidY(in: self.containerView, of: v)
+-                let scaleY = edgeScaleY(for: midY, containerHeight: H)
+-                var t = CATransform3DIdentity
+-                t = CATransform3DScale(t, 1.0, scaleY, 1.0)
+-                v.layer.transform = t
+-            }
+-            CATransaction.commit()
+-        }
+-
+-        private func tick() {
+-            guard let availableSize = self.availableSize else {
+-                return
+-            }
+-            let now = CACurrentMediaTime()
+-
+-            switch self.spinState {
+-            case .spinning:
+-                if let last = self.lastSpawnTime, now - last >= self.currentInterval || self.lastSpawnTime == nil {
+-                    self.spawnRandomSlot(availableSize: availableSize)
+-                }
+-            case .decelerating:
+-                let t = clamp01(self.decelTotalSteps > 1 ? Double(self.decelStepIndex) / Double(self.decelTotalSteps - 1) : 1.0)
+-                                
+-                if let last = self.lastSpawnTime, now - last >= self.currentInterval {
+-                    if !self.decelQueue.isEmpty {
+-                        let next = self.decelQueue.removeFirst()
+-                        let isFinal = self.decelQueue.isEmpty
+-                        let animDuration = isFinal ? nil : lerp(baseAnimDuration, maxAnimDuration, t)
+-                        self.spawnSlot(item: next, isFinal: isFinal, availableSize: availableSize, animDuration: animDuration, completion: {})
+-                        
+-                        self.motionBlurFactor = CGFloat(1.0 - t)
+-
+-                        self.decelStepIndex += 1
+-                    }
+-                } else if self.lastSpawnTime == nil {
+-                    if !self.decelQueue.isEmpty {
+-                        let next = self.decelQueue.removeFirst()
+-                        self.spawnSlot(item: next, availableSize: availableSize) {}
+-                    }
+-                }
+-
+-            case .settled, .idle:
+-                self.invalidateDisplayLinkIfIdle()
+-            }
+-            
+-            self.applyEdge3DSquish()
+-        }
+-
+-        private func finishSettled() {
+-            for (id, _) in self.motionBlurLayers {
+-                self.setMotionBlurFactor(id: id, factor: 0.0, transition: .easeInOut(duration: 0.2))
+-            }
+-            self.motionBlurLayers.removeAll()
+-
+-            self.spinState = .settled
+-            self.decelQueue.removeAll()
+-            self.invalidateDisplayLinkIfIdle()
+-        }
+-
+-        func update(
+-            component: SlotsComponent,
+-            availableSize: CGSize,
+-            state: EmptyComponentState,
+-            environment: Environment<ChildEnvironment>,
+-            transition: ComponentTransition
+-        ) -> CGSize {
+-            self.component = component
+-            self.environment = environment
+-            self.availableSize = availableSize
+-
+-            let size = component.size
+-            self.containerView.frame = CGRect(origin: CGPoint(x: 0.0, y: component.verticalOffset), size: size).insetBy(dx: 0.0, dy: -maskInset)
+-            self.maskLayer.frame = CGRect(origin: .zero, size: self.containerView.bounds.size)
+-
+-            let wasAnimating = self.isAnimating
+-            let nowAnimating = component.isAnimating
+-
+-            if nowAnimating && !wasAnimating {
+-                self.beginSpinning()
+-                self.spawnRandomSlot(availableSize: availableSize)
+-            } else if !nowAnimating && wasAnimating {
+-                self.beginDeceleration()
+-            } else if nowAnimating && self.spinState == .settled {
+-                self.beginSpinning()
+-                self.spawnRandomSlot(availableSize: availableSize)
+-            }
+-            
+-            if let tintColor = component.tintColor {
+-                for (id, itemView) in self.itemViews {
+-                    if let itemLayer = itemView.view?.layer {
+-                        transition.setTintColor(layer: itemLayer, color: tintColor)
+-                    }
+-                    if let blurLayer = self.motionBlurLayers[id] {
+-                        transition.setTintColor(layer: blurLayer, color: tintColor)
+-                    }
+-                }
+-            }
+-
+-            return size
+-        }
+-    }
+-
+-    public func makeView() -> View {
+-        return View()
+-    }
+-
+-    public func update(view: View, availableSize: CGSize, state: EmptyComponentState, environment: Environment<EnvironmentType>, transition: ComponentTransition) -> CGSize {
+-        return view.update(component: self, availableSize: availableSize, state: state, environment: environment, transition: transition)
+-    }
+-}
+-
+-private let minScaleYAtEdge: CGFloat = 0.7
+-private let squishFalloff: CGFloat = 0.12
+-
+-private func smoothstep(_ x: CGFloat) -> CGFloat {
+-    let t = max(0.0, min(1.0, x))
+-    return t * t * (3.0 - 2.0 * t)
+-}
+-
+-private func liveMidY(in container: UIView, of view: UIView) -> CGFloat {
+-    if let pres = view.layer.presentation() {
+-        let p = container.layer.convert(pres.position, from: view.layer.superlayer)
+-        return p.y
+-    }
+-    return view.center.y
+-}
+-
+-private func edgeScaleY(for midY: CGFloat, containerHeight H: CGFloat) -> CGFloat {
+-    guard H > 0 else { return 1.0 }
+-    let d = abs((midY - H * 0.5) / (H * 0.5))
+-    let uRaw = (d - squishFalloff) / (1.0 - squishFalloff)
+-    let u = smoothstep(max(0.0, min(1.0, uRaw)))
+-    return (1.0 - u) + minScaleYAtEdge * u
+-}
+-
+ 
+ final class SpacerComponent: Component {
+     let size: CGSize
